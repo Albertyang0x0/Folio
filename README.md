@@ -21,6 +21,11 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/Albertyang0x0/Folio/releases/latest/download/Folio-Portable-x64.zip"><strong>↓ 下载最新版 · Windows 便携版</strong></a><br>
+  <sub>解压即用，无需单独安装 Python · <a href="https://github.com/Albertyang0x0/Folio/releases/latest">查看版本说明</a></sub>
+</p>
+
+<p align="center">
   <img src="docs/images/folio-home.png" width="100%" alt="阅屿 Folio 冰川玻璃风格论文管理首页">
 </p>
 

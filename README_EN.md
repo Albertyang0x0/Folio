@@ -21,6 +21,11 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/Albertyang0x0/Folio/releases/latest/download/Folio-Portable-x64.zip"><strong>↓ Download the latest Windows portable build</strong></a><br>
+  <sub>Extract and run—no separate Python installation required · <a href="https://github.com/Albertyang0x0/Folio/releases/latest">Release notes</a></sub>
+</p>
+
+<p align="center">
   <img src="docs/images/folio-home.png" width="100%" alt="Yueyu Folio paper library with its glacier-glass interface">
 </p>
 
