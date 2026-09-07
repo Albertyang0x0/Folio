@@ -31,7 +31,7 @@
 
 ## Why Folio
 
-Folio is a local academic paper reader and translator built through **vibe coding**. It began with a simple question: **why should a translated paper stop looking like a paper?**
+Folio is a local academic paper reader and translator built through **vibe coding**.
 
 Many paper translation tools flatten a document into a stream of text, discarding its columns, heading hierarchy, figure placement, equation numbers, and citation structure. The result may be readable, but it is difficult to compare against the original paragraph by paragraph. Asking an agent to reconstruct an entire translated document is another option, but it requires substantial context, consumes more tokens, and often produces results that vary with the model and prompt.
 
