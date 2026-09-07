@@ -1,0 +1,2 @@
+pdf.min.js: 320004 bytes OK
+pdf.worker.min.js: 1087212 bytes OK

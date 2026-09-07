@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>阅屿 · Folio — 论文阅读与翻译</title>
+<meta name="application-name" content="阅屿 · Folio">
+<meta name="theme-color" content="#e5edf5">
+<link rel="icon" type="image/png" href="assets/yueyu-glacier.png">
+<link rel="apple-touch-icon" href="assets/yueyu-glacier.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ============ 主应用 ============ -->
+<div id="app" class="hidden">
+
+  <!-- 顶栏 -->
+  <header id="topbar">
+    <div class="reader-documentbar">
+    <div class="brand" role="img" aria-label="阅屿 · Folio" title="阅屿 · Folio">
+      <img class="logo" src="assets/yueyu-glacier.png" width="34" height="34" alt="" draggable="false">
+      <span class="brand-name">阅屿<span class="brand-latin" lang="en">Folio</span></span>
+    </div>
+
+    <button class="btn quiet" id="btnLibrary" title="返回论文库"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m14 6-6 6 6 6"/></svg>论文库</button>
+
+    <div id="tabs" class="tabs" aria-label="已打开的论文"></div>
+
+    <button class="btn primary" id="btnOpen" title="打开 PDF"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg><span>打开</span></button>
+    <div class="toolbar-divider" aria-hidden="true"></div>
+    <button class="icon" id="btnDocumentSearch" title="搜索文档（Ctrl+F）" aria-label="搜索文档"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="7.2"/><path d="m16 16 4.5 4.5"/></svg></button>
+    <button class="icon" id="btnSettings" title="设置" aria-label="设置"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 3-.6 2.3-2 .9L4.3 6l-2 3.5 1.5 1.7v2l-1.5 1.6 2 3.5 2.2-.5 2 .9L9 21h4l.6-2.3 2-.9 2.2.5 2-3.5-1.5-1.6v-2l1.5-1.7-2-3.5-2.2.4-2-.9L13 3Z"/><circle cx="11" cy="12" r="3"/></svg></button>
+    </div>
+
+    <div class="reader-toolstrip">
+    <div class="reader-view-tools">
+      <button id="btnSidebar" class="sidebar-toggle" title="收起/展开侧栏" aria-label="收起或展开文档导航" aria-controls="sidebar" aria-expanded="true"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M9 4v16M6 8h.01M6 12h.01"/></svg><span>导航</span></button>
+      <div class="toolbar-divider" aria-hidden="true"></div>
+      <span class="tool-label">阅读视图</span>
+      <div class="vseg" id="viewSeg" data-active-mode="continuous" role="group" aria-label="阅读模式">
+        <button class="v active" data-mode="continuous">连续</button>
+        <button class="v" data-mode="single">单页</button>
+        <button class="v" data-mode="duo">对照</button>
+      </div>
+    </div>
+    <div class="spacer"></div>
+    <!-- 全文搜索（Ctrl+F） -->
+    <div id="searchBox" class="searchbox hidden">
+      <svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="7.2"/><path d="m16 16 4.5 4.5"/></svg>
+      <input type="text" id="searchInput" placeholder="在文档中搜索…" aria-label="在文档中搜索">
+      <span id="searchCount" class="scount"></span>
+      <button class="icon small" id="btnSearchPrev" title="上一个 (Shift+Enter)">↑</button>
+      <button class="icon small" id="btnSearchNext" title="下一个 (Enter)">↓</button>
+      <button class="icon small" id="btnSearchClose" title="关闭 (Esc)">×</button>
+    </div>
+
+    <!-- 缩放 -->
+    <div class="zoom" id="zoomControls">
+      <button class="z" id="btnZoomOut" title="缩小">−</button>
+      <span class="zval" id="zoomVal">100%</span>
+      <button class="z" id="btnZoomIn" title="放大">＋</button>
+      <button class="btn small" id="btnFitWidth" title="适应阅读区宽度" aria-pressed="true">适宽</button>
+    </div>
+
+    <div class="note-controls" id="noteControls">
+      <button class="btn small" id="btnToggleMarks" aria-pressed="true">隐藏标记</button>
+      <button class="btn" id="btnNotes" aria-controls="notesSidebar" aria-expanded="false"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M13 4H5a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h13a2 2 0 0 0 2-2v-8M9 15l1-4L18 3l3 3-8 8-4 1Z"/></svg>笔记 <span id="noteCount">0</span></button>
+    </div>
+
+    <button class="btn small hidden" id="readerSaveStatus" aria-live="polite" title="阅读状态保存情况"></button>
+    </div>
+  </header>
+
+  <div id="main">
+    <!-- 左侧栏 -->
+    <aside id="sidebar">
+      <div class="sidebar-caption"><span>文档导航</span><span lang="en">CONTENTS</span></div>
+      <div class="shead">
+        <button class="s active" data-tab="thumbs">缩略图</button>
+        <button class="s" data-tab="outline">目录</button>
+        <button class="s" data-tab="bookmarks">书签</button>
+      </div>
+      <div id="thumbsPanel" class="spanel"></div>
+      <div id="outlinePanel" class="spanel hidden"></div>
+      <div id="bookmarksPanel" class="spanel hidden"></div>
+    </aside>
+
+    <!-- 阅读区 -->
+    <main id="viewer">
+      <div id="continuousView" class="view">
+        <div id="pages"></div>
+      </div>
+      <div id="singleView" class="view hidden">
+        <div class="single-stage"><div id="singlePage" class="reader-page"><canvas id="singleCanvas" class="page-canvas"></canvas></div></div>
+      </div>
+      <div id="duoView" class="view hidden">
+        <div class="duo-body">
+          <section class="duo-pane" id="duoOriginalPane" data-duo-side="original" aria-label="原文">
+            <div class="duo-toolbar">
+              <span class="duo-title" id="duoOriginalTitle">原文</span>
+              <div class="zoom" role="group" aria-label="原文缩放">
+                <button class="z" id="btnOrigZoomOut" title="缩小原文" aria-label="缩小原文">−</button>
+                <span class="zval" id="origZoomVal" aria-live="polite">100%</span>
+                <button class="z" id="btnOrigZoomIn" title="放大原文" aria-label="放大原文">＋</button>
+              </div>
+              <button class="btn small duo-fit" id="btnOrigFit" aria-pressed="true">适应宽度</button>
+            </div>
+            <div class="duo-scroll" id="duoOriginalScroll" tabindex="0" aria-labelledby="duoOriginalTitle">
+              <div class="duo-page"><canvas id="duoOrig" class="page-canvas"></canvas></div>
+            </div>
+          </section>
+          <section class="duo-pane" id="duoTranslationPane" data-duo-side="translation" aria-label="译文">
+            <div class="duo-toolbar">
+              <span class="duo-title" id="duoTranslationTitle">译文</span>
+              <div class="zoom" role="group" aria-label="译文缩放">
+                <button class="z" id="btnTransZoomOut" title="缩小译文" aria-label="缩小译文">−</button>
+                <span class="zval" id="transZoomVal" aria-live="polite">100%</span>
+                <button class="z" id="btnTransZoomIn" title="放大译文" aria-label="放大译文">＋</button>
+              </div>
+              <button class="btn small duo-fit" id="btnTransFit" aria-pressed="true">适应宽度</button>
+              <button class="btn small" id="btnToggleOriginal" aria-controls="duoOriginalPane" aria-expanded="true">隐藏原文</button>
+            </div>
+            <div id="translationNotice" class="translation-notice hidden" role="status" aria-live="polite">
+              <span id="translationMessage"></span>
+              <button class="btn small" id="btnRetryTranslation">重试未完成段落</button>
+            </div>
+            <div class="duo-scroll" id="duoTranslationScroll" tabindex="0" aria-labelledby="duoTranslationTitle">
+              <div class="duo-page"><canvas id="duoTrans" class="page-canvas"></canvas></div>
+            </div>
+          </section>
+        </div>
+      </div>
+    </main>
+
+    <aside id="notesSidebar" class="notes-sidebar hidden" aria-label="论文笔记">
+      <div class="notes-heading"><div><p class="panel-eyebrow">THOUGHTS & NOTES</p><h2>论文笔记</h2></div><button class="icon small" id="btnCloseNotes" aria-label="收起笔记栏" title="收起笔记栏">×</button></div>
+      <p class="notes-hint">留住此刻的想法。选中文字，即可添加笔记。</p>
+      <div id="notesList" class="notes-list" aria-label="本篇论文的笔记"></div>
+      <div id="noteEditor" class="note-editor hidden">
+        <div class="note-location"><button id="btnLocateNote" class="btn small">定位原文</button><span id="notePageLabel"></span></div>
+        <blockquote id="noteQuote"></blockquote>
+        <label for="noteBody">我的笔记</label>
+        <textarea id="noteBody" placeholder="记录想法、问题或总结…"></textarea>
+        <div class="note-editor-footer"><span id="noteSaveStatus" role="status" aria-live="polite"></span><button id="btnDeleteNote" class="btn small">删除批注</button></div>
+      </div>
+      <p class="notes-local">仅保存在当前浏览器本地；清除网站数据会删除笔记。</p>
+    </aside>
+  </div>
+
+  <!-- 底部 HUD -->
+  <div id="hud">
+    <button class="pgbtn" id="btnPrev" title="上一页">‹</button>
+    <span class="hud-label">页码</span><input type="number" id="pageInput" min="1" value="1" aria-label="当前页码">
+    <span class="page-total">/ <span id="pageCount">0</span></span>
+    <button class="pgbtn" id="btnNext" title="下一页">›</button>
+  </div>
+</div>
+
+<!-- ============ 本地论文库 ============ -->
+<main id="uploadScreen" aria-label="论文管理首页">
+  <div class="library-shell">
+    <header class="library-brandbar">
+      <div class="brand" role="img" aria-label="阅屿 · Folio" title="阅屿 · Folio">
+        <img class="logo" src="assets/yueyu-glacier.png" width="44" height="44" alt="" draggable="false">
+        <span class="brand-name">阅屿<span class="brand-latin" lang="en">Folio</span></span>
+      </div>
+      <span class="library-local"><span class="status-dot" aria-hidden="true"></span>本地论文库</span>
+      <div class="library-actions">
+        <button class="icon" id="btnLibrarySearch" title="搜索论文标题（Ctrl+F）" aria-label="搜索论文标题"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="7.2"/><path d="m16 16 4.5 4.5"/></svg></button>
+        <button class="btn quiet storage-entry" id="btnStorage" title="管理本机存储"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><ellipse cx="12" cy="5.5" rx="8" ry="3"/><path d="M4 5.5v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6M4 11.5v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg>存储</button>
+        <button class="icon" id="btnLibrarySettings" title="设置" aria-label="设置"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 3-.6 2.3-2 .9L4.3 6l-2 3.5 1.5 1.7v2l-1.5 1.6 2 3.5 2.2-.5 2 .9L9 21h4l.6-2.3 2-.9 2.2.5 2-3.5-1.5-1.6v-2l1.5-1.7-2-3.5-2.2.4-2-.9L13 3Z"/><circle cx="11" cy="12" r="3"/></svg></button>
+        <button class="btn primary" id="btnLibraryAdd"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>添加论文</button>
+      </div>
+    </header>
+    <section class="library-heading">
+      <div><p class="library-eyebrow"><span aria-hidden="true"></span>FOLIO WORKSPACE</p><h1>你的阅读空间</h1>
+      <p class="slogan">收好每一篇论文，接着上一次思考。</p></div>
+      <div class="workspace-caption"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 17 9 5l4 7 2-3 6 8H3ZM7 9l2 2 2-2"/></svg><span>沉浸阅读 · 自在探索</span></div>
+    </section>
+    <div class="library-overview">
+      <section id="resumeCard" class="resume-card hidden" aria-labelledby="resumeTitle">
+        <div class="resume-landscape" aria-hidden="true"></div>
+        <div class="resume-content">
+          <div class="resume-topline"><span class="resume-label"><span class="status-dot" aria-hidden="true"></span>继续上次阅读</span><time id="resumeTime"></time></div>
+          <h2 id="resumeTitle"></h2>
+          <div class="resume-bottom"><div class="resume-reading"><div class="resume-details"><span id="resumePosition"></span><span id="resumeMode"></span></div><div id="resumeProgress" class="resume-progress"></div></div>
+          <button id="btnResumePaper" class="btn primary">继续阅读<svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h16m-6-6 6 6-6 6"/></svg></button></div>
+        </div>
+      </section>
+      <button id="dropZone" type="button">
+        <span class="import-illustration" aria-hidden="true"><svg viewBox="0 0 40 48"><path d="M25 2H6a3 3 0 0 0-3 3v38a3 3 0 0 0 3 3h28a3 3 0 0 0 3-3V14L25 2Z"/><path d="M25 2v12h12M12 25h16M12 31h11"/></svg></span>
+        <span class="import-copy"><strong>下一篇，从这里开始</strong><span>拖入 PDF，或<span class="import-link">点击添加</span></span><span class="hint">最大 80MB · 文件保存在本机</span></span>
+        <svg class="ui-icon import-arrow" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5m-6 6 6-6 6 6"/></svg>
+      </button>
+    </div>
+    <section class="upload-card" aria-labelledby="libraryListTitle">
+      <div class="library-collectionbar"><div class="collection-title"><h2 id="libraryListTitle">全部论文</h2><span id="libraryCount">0 篇论文</span></div>
+      <div class="library-search"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="7.2"/><path d="m16 16 4.5 4.5"/></svg><input id="librarySearch" type="search" placeholder="搜索论文标题" aria-label="搜索论文标题" autocomplete="off"><kbd aria-hidden="true">Ctrl F</kbd><button id="librarySearchClear" class="icon small hidden" aria-label="清空标题搜索">×</button></div></div>
+      <div class="library-listbar"><span id="libraryResults">按最近阅读排序</span><span>阅读位置</span><span>最近阅读</span></div>
+      <div id="libraryList" aria-label="论文列表"></div>
+      <div id="libraryEmpty" class="library-empty hidden"><h2 id="libraryEmptyTitle">从第一篇论文开始</h2><p id="libraryEmptyHint"></p></div>
+      <button id="libraryMore" class="btn hidden">显示更多论文</button>
+    </section>
+    <footer class="library-footer"><span class="status-dot" aria-hidden="true"></span><span id="libraryStatus" role="status" aria-live="polite">正在加载论文库…</span><button id="libraryRetry" class="btn small hidden">重试</button><span class="footer-signature" lang="en">A little space for big ideas.</span></footer>
+    <input type="file" id="fileInput" accept=".pdf,application/pdf" hidden>
+  </div>
+</main>
+
+<!-- ============ 设置 ============ -->
+<div id="settingsModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="settingsTitle" aria-describedby="settingsDescription" tabindex="-1">
+  <div class="modal-card">
+    <div class="modal-heading"><div><p class="panel-eyebrow">MAKE IT YOURS</p><h2 id="settingsTitle">翻译设置</h2></div><button id="btnCloseSettings" class="icon" title="关闭设置" aria-label="关闭设置">×</button></div>
+    <p id="settingsDescription" class="modal-description">连接你的模型，按自己的方式阅读。</p>
+    <div class="settings-section"><h3>模型连接</h3>
+    <label>DeepSeek API Key
+      <div class="key-row">
+        <input type="password" id="setApiKey" placeholder="sk-...">
+        <button class="btn ghost small" id="btnShowKey" type="button">显示</button>
+      </div>
+    </label>
+    <label>模型
+      <select id="setModel">
+        <option value="deepseek-chat">deepseek-chat（推荐）</option>
+        <option value="deepseek-reasoner">deepseek-reasoner</option>
+      </select>
+    </label>
+    <label>API 地址
+      <input type="text" id="setBaseUrl" placeholder="https://api.deepseek.com">
+    </label>
+    </div>
+    <div class="settings-section"><h3>翻译偏好</h3><div class="settings-grid">
+    <label>目标语言
+      <input type="text" id="setTarget" value="简体中文">
+    </label>
+    <label>温度 <span class="field-hint">越低越稳定</span>
+      <input type="number" id="setTemperature" min="0" max="1" step="0.1">
+    </label>
+    </div></div>
+    <p class="modal-hint">Key 保存在当前浏览器。翻译时，本机后端会将相关文本发送给你配置的 API 服务。
+      <a href="https://platform.deepseek.com" target="_blank" rel="noopener noreferrer">获取 API Key →</a>
+    </p>
+    <div class="modal-actions">
+      <button class="btn" id="btnOpenStorageFromSettings">存储管理</button>
+      <span class="spacer"></span>
+      <button class="btn" id="btnCancelSettings">取消</button>
+      <button class="btn primary" id="btnSaveSettings">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 存储管理 ============ -->
+<div id="storageModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="storageTitle" aria-describedby="storageDescription" tabindex="-1">
+  <div class="modal-card storage-card">
+    <div class="modal-heading"><div><p class="panel-eyebrow">LOCAL STORAGE</p><h2 id="storageTitle">本机存储</h2></div><button id="btnCloseStorage" class="icon" title="关闭存储管理" aria-label="关闭存储管理">×</button></div>
+    <p id="storageDescription" class="modal-description">查看阅屿在这台电脑上的占用，并安全清理可重新生成的译文。</p>
+    <section class="storage-summary" aria-labelledby="storageUsedLabel">
+      <div class="storage-summary-line"><div><span id="storageUsedLabel">已使用</span><strong id="storageTotal">正在计算…</strong></div><span id="storageFree">磁盘空间读取中</span></div>
+      <div id="storageMeter" class="storage-meter" role="img" aria-label="存储分类占比"></div>
+    </section>
+    <div class="storage-list" aria-label="存储分类">
+      <div class="storage-row" data-storage-category="papers"><span class="storage-swatch"></span><div><strong>原始论文</strong><small>导入 Folio 的 PDF 文件</small></div><div><b class="storage-size">—</b><small class="storage-count"></small></div></div>
+      <div class="storage-row" data-storage-category="extracted"><span class="storage-swatch"></span><div><strong>版面数据</strong><small>页面文字、公式和结构索引</small></div><div><b class="storage-size">—</b><small class="storage-count"></small></div></div>
+      <div class="storage-row" data-storage-category="translations"><span class="storage-swatch"></span><div><strong>翻译缓存</strong><small>清理后需要重新翻译</small></div><div><b class="storage-size">—</b><small class="storage-count"></small></div></div>
+      <div class="storage-row" data-storage-category="records"><span class="storage-swatch"></span><div><strong>阅读记录</strong><small>论文信息与阅读位置</small></div><div><b class="storage-size">—</b><small class="storage-count"></small></div></div>
+      <div class="storage-row" data-storage-category="browser"><span class="storage-swatch"></span><div><strong>笔记与应用数据</strong><small>笔记、设置与桌面窗口数据</small></div><div><b class="storage-size">—</b><small class="storage-count">浏览器本地</small></div></div>
+    </div>
+    <div class="storage-location"><span>存储位置</span><code id="storagePath">—</code><button class="btn ghost small" id="btnCopyStoragePath" type="button">复制</button></div>
+    <p id="storageError" class="storage-error hidden" role="alert"></p>
+    <p class="storage-safety">清理翻译缓存不会删除 PDF、笔记、书签或阅读进度。</p>
+    <div class="modal-actions storage-actions">
+      <button class="btn danger" id="btnClearStorageCache" type="button" disabled>清理翻译缓存</button>
+      <button class="btn hidden" id="btnReloadStorage" type="button">重试</button>
+      <span class="spacer"></span>
+      <button class="btn primary" id="btnDoneStorage" type="button">完成</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 搜索结果面板 ============ -->
+<div id="searchPanel" class="hidden"></div>
+
+<div id="selectionToolbar" class="selection-toolbar hidden" role="toolbar" aria-label="选中文字操作">
+  <button id="btnAddNote" class="btn primary small">添加笔记</button>
+  <button id="btnCopySelection" class="btn small">复制</button>
+</div>
+
+<div id="toast" class="hidden"></div>
+
+<script src="vendor/pdf.min.js"></script>
+<script src="search.js"></script>
+<script src="annotations.js"></script>
+<script src="library.js"></script>
+<script src="storage.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
