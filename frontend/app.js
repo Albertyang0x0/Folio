@@ -826,8 +826,8 @@ function detectColumns(meta, excludedIds) {
   // A genuine single-column paper naturally crosses the page midpoint, so it
   // produces neither a narrow left nor a narrow right candidate. Keep its
   // body as one column instead of silently returning no drawable content.
-  if (!lc) return rc ? [rc] : [mk(body)];
-  if (!rc) return [lc];
+  if (!lc) return rc && rightBlocks.length === body.length ? [rc] : [mk(body)];
+  if (!rc) return leftBlocks.length === body.length ? [lc] : [mk(body)];
   const substantial = (col) => col.blocks.length >= 2 || col.blocks.some((b) => {
     const height = b.bbox[3] - b.bbox[1];
     return height >= meta.height * 0.12 || String(b.text || "").length >= 160;
