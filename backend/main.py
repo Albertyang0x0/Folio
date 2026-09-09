@@ -60,7 +60,7 @@ async def _no_cache_static(request, call_next):
 
 MAX_PDF = 80 * 1024 * 1024
 CHUNK_CHARS = 6000  # 每次请求最多送这么多字符去翻译
-EXTRACT_VER = 16  # 泛化 CMR 正文、跨栏摘要和碎片化公式的版面识别
+EXTRACT_VER = 17  # 支持无标点表题与开放式横线表格的联合识别
 PROMPT_VER = 6    # 新校验兼容已有合格译文；保留版本以迁移内容未变的页缓存
 
 
