@@ -793,8 +793,9 @@ function detectCoverHeaderBlocks(meta) {
   });
 }
 
-// 检测分栏：按页面中线把正文块分左右两栏。首页允许一个很长的文本块
-// 独自构成右栏（PDF 提取器经常把整栏正文合并为一个块）。
+// 检测分栏：先寻找真正位于中线两侧的窄正文块，再识别双栏之前的跨栏导语。
+// 不能把所有 x0 < mid 的块都塞进左栏：无显式 Abstract 标题的 TeX 首页常把
+// 摘要做成一个跨栏块，旧逻辑会因此让整页退化成超宽单栏。
 function detectColumns(meta, excludedIds) {
   const excluded = excludedIds || new Set();
   const body = meta.blocks.filter((b) => !b.math && !b.skip && !excluded.has(b.id));
@@ -811,16 +812,40 @@ function detectColumns(meta, excludedIds) {
       blocks: blocks,
     };
   };
-  const lc = mk(body.filter((b) => b.bbox[0] < mid));
-  const rc = mk(body.filter((b) => b.bbox[0] >= mid));
-  if (!lc) return rc ? [rc] : [];
+  const slack = Math.max(3, meta.width * 0.012);
+  const leftBlocks = body.filter((b) => {
+    const center = (b.bbox[0] + b.bbox[2]) / 2;
+    return center < mid && b.bbox[2] <= mid + slack;
+  });
+  const rightBlocks = body.filter((b) => {
+    const center = (b.bbox[0] + b.bbox[2]) / 2;
+    return center >= mid && b.bbox[0] >= mid - slack;
+  });
+  const lc = mk(leftBlocks);
+  const rc = mk(rightBlocks);
+  // A genuine single-column paper naturally crosses the page midpoint, so it
+  // produces neither a narrow left nor a narrow right candidate. Keep its
+  // body as one column instead of silently returning no drawable content.
+  if (!lc) return rc ? [rc] : [mk(body)];
   if (!rc) return [lc];
-  const longRightBlock = meta.page === 0 && rc.blocks.some((b) => {
+  const substantial = (col) => col.blocks.length >= 2 || col.blocks.some((b) => {
     const height = b.bbox[3] - b.bbox[1];
     return height >= meta.height * 0.12 || String(b.text || "").length >= 160;
   });
-  if ((!longRightBlock && rc.blocks.length < 3) || rc.x0 <= lc.x1 - 5) return [mk(body)];
-  return [lc, rc];
+  if (!substantial(lc) || !substantial(rc) || rc.x0 <= lc.x1 + 4) return [mk(body)];
+
+  const assigned = new Set(leftBlocks.concat(rightBlocks).map((b) => b.id));
+  const firstColumnTop = Math.min(lc.top, rc.top);
+  const spanningBlocks = body.filter((b) => !assigned.has(b.id)
+    && b.bbox[0] < mid && b.bbox[2] > mid
+    && b.bbox[3] <= firstColumnTop - 1);
+  const spanningIds = new Set(spanningBlocks.map((b) => b.id));
+  // A mid-page cross-column text block needs a true banded layout. Until such a
+  // block is modeled, keep the safe single-column fallback rather than dropping it.
+  if (body.some((b) => !assigned.has(b.id) && !spanningIds.has(b.id))) return [mk(body)];
+  const columns = [lc, rc];
+  columns.spanningBlocks = spanningBlocks.sort((a, b) => a.bbox[1] - b.bbox[1]);
+  return columns;
 }
 
 // 首页页眉按原始纵向位置居中绘制；译文换行时向下扩展，但不侵入摘要区。
@@ -867,6 +892,7 @@ function reflowPage(ctx, src, meta, map, vp, scale, dpr) {
   const coverHeader = detectCoverHeaderBlocks(meta);
   const headerIds = new Set(coverHeader.map((b) => b.id));
   const cols = detectColumns(meta, headerIds);
+  const spanningBlocks = cols.spanningBlocks || [];
   // Equations belong in the same reading stream as prose. Only graphics and
   // explicitly protected blocks retain their original page coordinates.
   const equations = meta.blocks.filter((b) => b.math && b.display_math && !b.skip);
@@ -889,9 +915,23 @@ function reflowPage(ctx, src, meta, map, vp, scale, dpr) {
   const hasInlineMath = meta.blocks.some((b) => !b.math && !b.skip && b.inline_math && b.inline_math.length);
   const allowOverflow = hasInlineMath || equations.length > 0;
   const headerBottom = drawCoverHeader(ctx, coverHeader, map, meta, vp, scale, dpr, fam, src, true);
+  // Full-width lead paragraphs (most often an abstract without an explicit
+  // heading) are flowed before the two columns, using their original width.
+  const spanningFlows = [];
+  let leadBottom = headerBottom;
+  for (const b of spanningBlocks) {
+    const rect = toViewportRect(b.bbox, vp, meta);
+    if (leadBottom) rect.y = Math.max(rect.y, leadBottom + bodyFs * scale * dpr * 0.45);
+    const obstacles = (meta.protected || []).map((bbox) => toViewportRect(bbox, vp, meta))
+      .filter((pr) => pr.x + pr.w > rect.x - 2 && pr.x < rect.x + rect.w + 2);
+    const bottom = flowColumn(ctx, rect, [b], map, bodyFs, fam, scale, dpr,
+      obstacles, meta, src, vp, true, true);
+    spanningFlows.push({ rect, block: b, obstacles });
+    leadBottom = Math.max(leadBottom, bottom);
+  }
   const flows = cols.map((col) => {
     const colRect = toViewportRect([col.x0, col.top, col.x1, col.bottom], vp, meta);
-    if (headerBottom) colRect.y = Math.max(colRect.y, headerBottom + bodyFs * scale * dpr * 0.8);
+    if (leadBottom) colRect.y = Math.max(colRect.y, leadBottom + bodyFs * scale * dpr * 0.8);
     const obstacles = [];
     const push = (bbox) => {
       const pr = toViewportRect(bbox, vp, meta);
@@ -904,7 +944,7 @@ function reflowPage(ctx, src, meta, map, vp, scale, dpr) {
   });
   // 高公式增大局部行高时不能再截断页底。先测量，再扩展译文画布；原文页不变。
   if (allowOverflow) {
-    let neededHeight = Math.max(src.height, headerBottom);
+    let neededHeight = Math.max(src.height, leadBottom);
     for (const f of flows) {
       const bottom = flowColumn(ctx, f.colRect, f.col.blocks, map, bodyFs, fam, scale, dpr,
         f.obstacles, meta, src, vp, true, true);
@@ -935,7 +975,12 @@ function reflowPage(ctx, src, meta, map, vp, scale, dpr) {
   for (const rect of (meta.protected || [])) restore(rect);
   // 3) 首页页眉独立居中绘制，不参与正文栏宽度计算
   drawCoverHeader(ctx, coverHeader, map, meta, vp, scale, dpr, fam, src, false);
-  // 4) 各栏流动排版译文（避开保护区块）
+  // 4) 双栏之前的跨栏导语按原始宽度排版
+  for (const f of spanningFlows) {
+    flowColumn(ctx, f.rect, [f.block], map, bodyFs, fam, scale, dpr,
+      f.obstacles, meta, src, vp, false, true);
+  }
+  // 5) 各栏流动排版译文（避开保护区块）
   for (const f of flows) {
     flowColumn(ctx, f.colRect, f.col.blocks, map, bodyFs, fam, scale, dpr,
       f.obstacles, meta, src, vp, false, allowOverflow);

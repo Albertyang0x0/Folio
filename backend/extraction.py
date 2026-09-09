@@ -43,6 +43,11 @@ def _is_math_line(text, font):
     # A function definition is not prose merely because it contains four words.
     if _is_function_definition(text, font):
         return True
+    # Explanatory clauses around display equations are prose even when most of
+    # their remaining glyphs use math fonts (common in physics papers).
+    if (re.search(r"\b(?:where|with)\b", text, re.I)
+            and not re.search(r"\(\d+\)\s*$", text)):
+        return False
     # 含少量内联数学符号的自然语言仍是正文。旧逻辑会把含 →、τ、Pass@1
     # 的完整句子整块判为公式，导致后端不翻译、前端又把原文裁回来。
     if len(words) >= 4 and sum(len(w) for w in words) >= max(12, syms * 3):
@@ -625,47 +630,138 @@ def _merge_formula_continuations(blocks):
 
 
 def _merge_display_math_fragments(blocks, page_width):
-    """Join horizontally adjacent PDF objects belonging to one display equation.
+    """Join the PDF objects that visually form one display equation.
 
-    TeX often stores a fraction's left prefix (for example ``L = -1/N``) and
-    the summation to its right as separate objects. Their ink overlaps on the
-    vertical axis but a tiny horizontal gap means PyMuPDF does not consider
-    their rectangles intersecting. If left separate, the flow renderer sorts
-    by y0 and can place the taller summation before the prefix.
+    TeX does not guarantee that one equation becomes one PDF text block.  A
+    fraction, delimiter, equation number, or the two rows of an aligned formula
+    may all be emitted separately and in an order unrelated to reading order.
+    The old previous-block-only rule therefore worked for simple equations but
+    left dense formulas as many independently flowed crops.
 
-    The narrow-gap and strong-y-overlap requirements deliberately exclude
-    stacked equations and equations in separate columns.
+    Build local connected components instead.  Connections require the same
+    page column plus close/overlapping geometry; two different numbered rows
+    are kept separate.  Very short non-math fragments are admitted only when
+    they look formula-like, which recovers denominators that were classified by
+    their Roman font without swallowing nearby explanatory prose.
     """
-    result = []
-    for block in blocks:
-        previous = result[-1] if result else None
-        if (previous and previous.get("math") and block.get("math")
-                and not previous.get("skip") and not block.get("skip")):
-            a, b = fitz.Rect(previous["bbox"]), fitz.Rect(block["bbox"])
-            y_overlap = min(a.y1, b.y1) - max(a.y0, b.y0)
-            if a.x1 < b.x0:
-                gap = b.x0 - a.x1
-            elif b.x1 < a.x0:
-                gap = a.x0 - b.x1
-            else:
-                gap = 0.0
-            size = max(float(previous.get("font_size") or 10), float(block.get("font_size") or 10))
-            union = a | b
-            if (y_overlap >= min(a.height, b.height) * .45
-                    and gap <= max(4.0, size * .7)
-                    and union.width <= page_width * .85):
-                left, right = (previous, block) if a.x0 <= b.x0 else (block, previous)
-                previous["text"] = left.get("text", "") + " " + right.get("text", "")
-                previous["translation_text"] = (left.get("translation_text", left.get("text", "")) + " "
-                                                + right.get("translation_text", right.get("text", "")))
-                previous["inline_math"] = left.get("inline_math", []) + right.get("inline_math", [])
-                previous["bbox"] = [round(v, 2) for v in union]
-                previous["font_size"] = round((float(left.get("font_size") or 10)
-                                               + float(right.get("font_size") or 10)) / 2, 2)
-                previous["_whole_math"] = True
+    if len(blocks) < 2:
+        return blocks
+
+    def formula_candidate(block):
+        if block.get("skip"):
+            return False
+        if block.get("math"):
+            return True
+        text = (block.get("text") or "").strip()
+        size = float(block.get("font_size") or 10)
+        rect = fitz.Rect(block["bbox"])
+        words = re.findall(r"[A-Za-z]{2,}", text)
+        equation_number = bool(re.fullmatch(r"\(\d+\)", text))
+        if re.match(r"^(?:where|with)\b", text, re.I):
+            return False
+        natural_words = [w for w in words if w.lower() not in {
+            "sin", "cos", "log", "exp", "max", "min", "relu", "softmax",
+        }]
+        return equation_number or (len(text) <= 36 and len(natural_words) <= 1
+                and rect.height <= size * 3.2
+                and (block.get("inline_math") or EQUATION_RE.search(text)
+                     or any(ch in MATH_CHARS for ch in text)))
+
+    candidates = [i for i, block in enumerate(blocks) if formula_candidate(block)]
+    if len(candidates) < 2:
+        return blocks
+    parent = {i: i for i in candidates}
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i, j):
+        a, b = find(i), find(j)
+        if a != b:
+            parent[b] = a
+
+    def side(rect):
+        mid = page_width / 2
+        if rect.x1 <= mid + 3:
+            return -1
+        if rect.x0 >= mid - 3:
+            return 1
+        return 0
+
+    def gap(a0, a1, b0, b1):
+        return max(0.0, max(a0, b0) - min(a1, b1))
+
+    for pos, i in enumerate(candidates):
+        a = fitz.Rect(blocks[i]["bbox"])
+        a_number = re.findall(r"\((\d+)\)", blocks[i].get("text", ""))
+        a_number_only = bool(re.fullmatch(r"\(\d+\)", (blocks[i].get("text") or "").strip()))
+        for j in candidates[pos + 1:]:
+            b = fitz.Rect(blocks[j]["bbox"])
+            sa, sb = side(a), side(b)
+            if sa and sb and sa != sb:
                 continue
-        result.append(block)
-    return result
+            union_rect = a | b
+            width_limit = page_width * (.52 if sa == sb and sa else .88)
+            if union_rect.width > width_limit:
+                continue
+            b_number = re.findall(r"\((\d+)\)", blocks[j].get("text", ""))
+            b_number_only = bool(re.fullmatch(r"\(\d+\)", (blocks[j].get("text") or "").strip()))
+            if a_number and b_number and a_number[-1] != b_number[-1]:
+                continue
+            size = max(float(blocks[i].get("font_size") or 10),
+                       float(blocks[j].get("font_size") or 10))
+            x_gap = gap(a.x0, a.x1, b.x0, b.x1)
+            y_gap = gap(a.y0, a.y1, b.y0, b.y1)
+            x_overlap = min(a.x1, b.x1) - max(a.x0, b.x0)
+            y_overlap = min(a.y1, b.y1) - max(a.y0, b.y0)
+            same_row = (y_overlap >= min(a.height, b.height) * .18
+                        and x_gap <= max(14.0, size * 1.8))
+            stacked = (x_overlap >= min(a.width, b.width) * .15
+                       and y_gap <= max(1.5, size * .18))
+            number_touch = ((a_number_only or b_number_only)
+                            and x_gap <= max(20.0, size * 2.0)
+                            and y_gap <= max(8.0, size * .9))
+            if same_row or stacked or number_touch:
+                union(i, j)
+
+    groups = {}
+    for i in candidates:
+        groups.setdefault(find(i), []).append(i)
+    merged_at, consumed = {}, set()
+    for ids in groups.values():
+        if len(ids) < 2 or not any(blocks[i].get("math") for i in ids):
+            continue
+        # A component must contain an equation anchor, not merely nearby symbols.
+        joined = " ".join(blocks[i].get("text", "") for i in ids)
+        if not (EQUATION_RE.search(joined) or re.search(r"\(\d+\)", joined)
+                or any(ch in joined for ch in "∑∫∏")):
+            continue
+        # Source order is generally the intended textual order even when a tall
+        # fraction starts slightly above the expression to its left.
+        ordered = sorted(ids)
+        rect = fitz.Rect(blocks[ordered[0]]["bbox"])
+        for i in ordered[1:]:
+            rect |= fitz.Rect(blocks[i]["bbox"])
+        first = min(ids)
+        merged = dict(blocks[first])
+        merged["bbox"] = [round(v, 2) for v in rect]
+        merged["text"] = " ".join(blocks[i].get("text", "") for i in ordered)
+        merged["translation_text"] = merged["text"]
+        merged["inline_math"] = []
+        merged["math"] = True
+        merged["skip"] = False
+        merged["_whole_math"] = True
+        merged["font_size"] = round(sum(float(blocks[i].get("font_size") or 10) for i in ids) / len(ids), 2)
+        merged_at[first] = merged
+        consumed.update(ids)
+
+    if not consumed:
+        return blocks
+    return [merged_at[i] if i in merged_at else block
+            for i, block in enumerate(blocks) if i not in consumed or i in merged_at]
 
 
 def _attach_formula_drawings(page, blocks):
@@ -943,20 +1039,34 @@ def _math_only_source(block):
     spans = [s for ln in block.get("lines", []) for s in ln["spans"] if s.get("text", "").strip()]
     if not spans or not all(_is_horizontal(ln) for ln in block["lines"]):
         return False
-    # CMR spells operator names in math mode. Other font families may contain a
-    # short 'where', but never accept a full prose sentence as a display equation.
+    # CMR spells operator names in math mode, but many TeX papers also use CMR
+    # for every word of the body.  Do not discard the whole CMR family here:
+    # doing so makes a long paragraph containing one CMMI/CMSY symbol look like
+    # a math-only source block.  Count all full-size, non-dedicated Roman spans
+    # and only allow the small vocabulary that legitimately occurs in formulas.
     main_size = max((float(s.get("size") or 10) for s in spans
                      if "cmex" not in s.get("font", "").lower()), default=10.0)
     prose = " ".join(s["text"] for s in spans if not _dedicated_math_span(s)
-                     and "cmr" not in s.get("font", "").lower()
+                     and "cmex" not in s.get("font", "").lower()
                      and float(s.get("size") or 10) >= main_size * .90)
-    words = re.findall(r"[A-Za-z]{2,}", prose.lower())
+    raw_words = re.findall(r"[A-Za-z]{2,}", prose)
+    words = [word.lower() for word in raw_words]
     # A short prose fragment such as the wrapped suffix 'ments:' is still
     # prose, not an operator. Small subscripts such as 'sort' are not prose;
     # among full-size words only allow conventional formula connectors.
-    operators = {"where", "and", "for", "relu", "softmax", "sigmoid", "tanh",
+    operators = {"where", "and", "for", "mod", "relu", "softmax", "sigmoid", "tanh",
                  "log", "exp", "max", "min", "sin", "cos", "concat", "attention"}
-    return (len(words) <= 4 and all(word in operators for word in words)
+    # A display equation can contain an uppercase function name (FFN,
+    # MultiHead), but an unknown lower-case Roman word is almost always prose.
+    # This also catches wrapped suffixes such as ``ments:`` that happen to
+    # share a raw PDF block with the equation beginning on the same line.
+    if any(word.lower() not in operators and word[:1].islower() for word in raw_words):
+        return False
+    source_text = " ".join(s["text"] for s in spans)
+    formula_syntax = bool(EQUATION_RE.search(source_text)
+                          or re.search(r"\(\d+\)\s*$", source_text))
+    return (len(words) <= 4
+            and (all(word in operators for word in words) or formula_syntax)
             and any(_dedicated_math_span(s) for s in spans))
 
 
