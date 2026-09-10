@@ -19,11 +19,14 @@ LATEX_RE = re.compile(r"\\[a-zA-Z]+")
 BRACE_MATH_RE = re.compile(r"[_^=←→±≤≥∈∑∫∂√]")
 EQUATION_RE = re.compile(r"=|→|^\s*(arg|max|min)\b|\^|_")
 ALGO_START_RE = re.compile(r"^\s*(Algorithm|Alg\.)\s*\d+", re.I)
-# 表格标题：要求 "Table N" 后跟冒号/句点/破折号，避免匹配 "Table 2 summarizes..." 这类正文句
-TABLE_CAPTION_RE = re.compile(r"^\s*(Table|Tab\.)\s*\d+\s*[:.\u00b7\u2013\u2014]", re.I)
+# 表格标题：编号既可能是阿拉伯数字，也可能是期刊常用的罗马数字。
+# 严格形式仍要求其后有冒号/句点/破折号，避免匹配 "Table 2 summarizes..."。
+TABLE_NUMBER_PATTERN = r"(?:\d+|[IVXLCDM]+)"
+TABLE_CAPTION_RE = re.compile(
+    rf"^\s*(Table|Tab\.)\s*{TABLE_NUMBER_PATTERN}\s*[:.\u00b7\u2013\u2014]", re.I)
 # 有些模板在编号后不加冒号或句点。这个宽松形式只能与真实横线/数值网格
 # 联合使用，不能单独作为表格依据，否则 "Table 2 summarizes..." 会误报。
-TABLE_START_RE = re.compile(r"^\s*(Table|Tab\.)\s*\d+\b", re.I)
+TABLE_START_RE = re.compile(rf"^\s*(Table|Tab\.)\s*{TABLE_NUMBER_PATTERN}\b", re.I)
 # 图注：要求 "Figure N" 后跟冒号/句点/破折号
 FIG_CAPTION_RE = re.compile(r"^\s*(Figure|Fig\.)\s*\d+\s*[:.\u00b7\u2013\u2014]", re.I)
 # 参考文献：引文编号 [1] / [1,2] / [1-3] 起始
@@ -1434,9 +1437,14 @@ def _ruled_table_regions(page):
         if r.width >= max(80, page.rect.width * .18) and r.height <= 2:
             rules.append(r)
     groups = []
+    caption_tops = [r.y0 for r in captions]
     for r in sorted(rules, key=lambda r: r.y0):
-        group = next((g for g in groups if abs(g[0].x0 - r.x0) <= 3
-                      and abs(g[0].x1 - r.x1) <= 3 and r.y0 - g[-1].y1 <= 65), None)
+        group = next((g for g in groups
+                      if (min(g[0].x1, r.x1) - max(g[0].x0, r.x0)
+                          >= min(g[0].width, r.width) * .9)
+                      and (abs(g[0].x0 - r.x0) <= 3 or abs(g[0].x1 - r.x1) <= 3)
+                      and r.y0 - g[-1].y1 <= max(70, page.rect.height * .17)
+                      and not any(g[-1].y1 < y < r.y0 for y in caption_tops)), None)
         if group is None:
             groups.append([r])
         else:
