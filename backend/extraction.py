@@ -13,8 +13,10 @@ SKIP_RE = re.compile(
 MATH_CHARS = set("∑∫∏∂√∇∞∈∉⊂⊆∀∃≤≥≠±×÷⋅→←↔⇒⇔∪∩∅⊗⊕⊥∥⋯…≈≡∝≪≫−∼⟨⟩"
                 "αβγδεζηθικλμνξοπρστυφχψωΓΔΘΛΞΠΣΦΨΩ⋆∗∴∵∘∙†‡")
 # 常见数学字体名（LaTeX/Word 数学模式专用字体）
-MATH_FONTS = ("cmmi", "cmsy", "cmex", "msam", "msbm", "mtmi", "mtsyn",
-              "latinmodernmath", "xits", "stix", "cambria math", "cambriamath", "mathjax")
+MATH_FONTS = ("cmmi", "cmsy", "cmex", "msam", "msbm", "mtmi", "mtsyn", "txsy",
+              "latinmodernmath", "xchartermath", "libertinusmath", "newtxmath",
+              "texgyretermesmath", "asana math", "firamath", "xits", "stix",
+              "cambria math", "cambriamath", "mathjax")
 LATEX_RE = re.compile(r"\\[a-zA-Z]+")
 BRACE_MATH_RE = re.compile(r"[_^=←→±≤≥∈∑∫∂√]")
 EQUATION_RE = re.compile(r"=|→|^\s*(arg|max|min)\b|\^|_")
@@ -672,6 +674,129 @@ def _merge_display_math_fragments(blocks, page_width):
                 and rect.height <= size * 3.2
                 and (block.get("inline_math") or EQUATION_RE.search(text)
                      or any(ch in MATH_CHARS for ch in text)))
+
+    def numbered_equation_fragment(block):
+        """A permissive fragment test used only inside a numbered equation band.
+
+        TeX engines often emit digits, delimiters and operator names in a Roman
+        font, so the ordinary line-level math classifier cannot see them.  The
+        surrounding equation number plus prose boundaries provide the missing
+        structural evidence; within that narrow band short mathematical pieces
+        are safe to admit.
+        """
+        if block.get("skip"):
+            return False
+        if formula_candidate(block):
+            return True
+        text = (block.get("text") or "").strip()
+        size = float(block.get("font_size") or 10)
+        rect = fitz.Rect(block["bbox"])
+        words = re.findall(r"[A-Za-z]{2,}", text)
+        natural_words = [w for w in words if w.lower() not in {
+            "sin", "cos", "log", "exp", "max", "min", "clip", "relu", "softmax",
+        }]
+        math_alphabet = any("\U0001d400" <= ch <= "\U0001d7ff" for ch in text)
+        formula_mark = (math_alphabet or any(ch in MATH_CHARS for ch in text)
+                        or bool(re.search(r"[=<>|_{}]|\d", text)))
+        return (bool(text) and len(text) <= 72 and len(natural_words) <= 1
+                and rect.height <= size * 4.2 and formula_mark
+                and not re.search(r"[.!?]\s*$", text))
+
+    def natural_prose(block):
+        if block.get("skip") or block.get("math") or formula_candidate(block):
+            return False
+        text = (block.get("text") or "").strip()
+        return len(text) >= 24 and len(re.findall(r"[A-Za-z]{2,}", text)) >= 4
+
+    # First recover complete numbered equations.  Their right-aligned number is
+    # a much stronger anchor than PDF object order or font names.  Neighbouring
+    # prose determines both the column and the vertical band, so wide fractions
+    # can be joined without absorbing text from another column or paragraph.
+    short_number_re = re.compile(r"^[,.;:]?\s*\(\d+[a-z]?\)\s*$", re.I)
+    number_ids = [i for i, block in enumerate(blocks)
+                  if (short_number_re.fullmatch((block.get("text") or "").strip())
+                      or (formula_candidate(block)
+                          and re.search(r"\(\d+[a-z]?\)\s*$", (block.get("text") or "").strip(), re.I)))]
+    numbered_groups = []
+    claimed = set()
+    number_centers = sorted(
+        ((i, (blocks[i]["bbox"][1] + blocks[i]["bbox"][3]) / 2) for i in number_ids),
+        key=lambda item: item[1])
+    for number_pos, (number_id, center_y) in enumerate(number_centers):
+        number = blocks[number_id]
+        nr = fitz.Rect(number["bbox"])
+        size = max(7.0, float(number.get("font_size") or 10))
+        prose = []
+        for i, block in enumerate(blocks):
+            if i == number_id or not natural_prose(block):
+                continue
+            r = fitz.Rect(block["bbox"])
+            # The number sits at the right edge of its text column.  This edge
+            # check disambiguates simultaneous equations in two-column papers.
+            if r.x0 <= nr.x0 + size and abs(r.x1 - nr.x1) <= page_width * .16:
+                prose.append((i, r))
+        above = [r for _, r in prose if r.y1 <= nr.y0 + size * .3]
+        below = [r for _, r in prose if r.y0 >= nr.y1 - size * .3]
+        previous = max(above, key=lambda r: r.y1) if above else None
+        following = min(below, key=lambda r: r.y0) if below else None
+        nearest = min((r for r in (previous, following) if r is not None),
+                      key=lambda r: min(abs(center_y - r.y0), abs(center_y - r.y1)),
+                      default=None)
+        number_only = bool(short_number_re.fullmatch((number.get("text") or "").strip()))
+        # An embedded trailing number without surrounding prose is ambiguous:
+        # it may simply be one of two vertically stacked synthetic equations.
+        # Leave that case to the conservative geometric component matcher.
+        if not number_only and nearest is None:
+            continue
+        col_x0 = nearest.x0 - size if nearest is not None else 0
+        col_x1 = nearest.x1 + size if nearest is not None else page_width
+        vertical_limit = max(34.0, size * 4.5)
+        top = max(center_y - vertical_limit, previous.y1 + 1 if previous is not None else 0)
+        bottom = min(center_y + vertical_limit,
+                     following.y0 - 1 if following is not None else float("inf"))
+        if number_pos:
+            top = max(top, (number_centers[number_pos - 1][1] + center_y) / 2)
+        if number_pos + 1 < len(number_centers):
+            bottom = min(bottom, (center_y + number_centers[number_pos + 1][1]) / 2)
+        ids = []
+        for i, block in enumerate(blocks):
+            if i in claimed or not numbered_equation_fragment(block):
+                continue
+            r = fitz.Rect(block["bbox"])
+            if r.y1 < top or r.y0 > bottom:
+                continue
+            if r.x1 < col_x0 or r.x0 > col_x1:
+                continue
+            ids.append(i)
+        if number_id not in ids:
+            ids.append(number_id)
+        if len(ids) >= 2 and any(i != number_id for i in ids):
+            ids = sorted(set(ids))
+            numbered_groups.append(ids)
+            claimed.update(ids)
+
+    if numbered_groups:
+        merged_at = {}
+        consumed = set()
+        for ids in numbered_groups:
+            rect = fitz.Rect(blocks[ids[0]]["bbox"])
+            for i in ids[1:]:
+                rect |= fitz.Rect(blocks[i]["bbox"])
+            first = ids[0]
+            merged = dict(blocks[first])
+            merged["bbox"] = [round(v, 2) for v in rect]
+            merged["text"] = " ".join(blocks[i].get("text", "") for i in ids)
+            merged["translation_text"] = merged["text"]
+            merged["inline_math"] = []
+            merged["math"] = True
+            merged["skip"] = False
+            merged["_whole_math"] = True
+            merged["font_size"] = round(sum(float(blocks[i].get("font_size") or 10)
+                                             for i in ids) / len(ids), 2)
+            merged_at[first] = merged
+            consumed.update(ids)
+        blocks = [merged_at[i] if i in merged_at else block
+                  for i, block in enumerate(blocks) if i not in consumed or i in merged_at]
 
     candidates = [i for i, block in enumerate(blocks) if formula_candidate(block)]
     if len(candidates) < 2:

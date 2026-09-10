@@ -60,7 +60,7 @@ async def _no_cache_static(request, call_next):
 
 MAX_PDF = 80 * 1024 * 1024
 CHUNK_CHARS = 6000  # 每次请求最多送这么多字符去翻译
-EXTRACT_VER = 18  # 支持长分组表格、罗马数字表号和科学计数法表体
+EXTRACT_VER = 20  # 长公式按编号、栏边界与正文间隔整体合并
 PROMPT_VER = 6    # 新校验兼容已有合格译文；保留版本以迁移内容未变的页缓存
 
 
