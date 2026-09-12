@@ -52,6 +52,51 @@ function throttle(fn, ms) {
   };
 }
 
+/* ================= 沉浸阅读顶栏 ================= */
+const ReaderChrome = (() => {
+  function updateSearchPanelTop() {
+    requestAnimationFrame(() => {
+      const top = $('app').classList.contains('reader-chrome-collapsed')
+        ? 10
+        : $('topbar').getBoundingClientRect().bottom + 8;
+      document.documentElement.style.setProperty('--search-panel-top', top + 'px');
+    });
+  }
+
+  function setCollapsed(collapsed) {
+    const app = $('app');
+    if (app.classList.contains('reader-chrome-collapsed') === collapsed) return;
+    if (collapsed && $('topbar').contains(document.activeElement)) document.activeElement.blur();
+    app.classList.toggle('reader-chrome-collapsed', collapsed);
+    $('topbar').inert = collapsed;
+    $('topbar').setAttribute('aria-hidden', String(collapsed));
+    const button = $('btnReaderChrome');
+    button.setAttribute('aria-expanded', String(!collapsed));
+    button.setAttribute('aria-label', collapsed ? '展开顶部导航' : '收起顶部导航');
+    button.title = collapsed ? '展开顶部导航' : '收起顶部导航';
+    updateSearchPanelTop();
+  }
+
+  function reveal() {
+    setCollapsed(false);
+  }
+
+  function init() {
+    $('btnReaderChrome').addEventListener('click', () => {
+      const collapse = !$('app').classList.contains('reader-chrome-collapsed');
+      if (collapse && !$('searchBox').classList.contains('hidden')) closeSearch();
+      setCollapsed(collapse);
+    });
+
+    $('readerChrome').addEventListener('transitionend', (event) => {
+      if (event.propertyName !== 'grid-template-rows') return;
+      if (state.mode === 'continuous' && cur() && !$('app').classList.contains('hidden')) renderVisible();
+    });
+  }
+
+  return { init, reveal };
+})();
+
 /* ================= 持久化 ================= */
 function _loadJson(key) { try { return JSON.parse(localStorage.getItem(key) || "null"); } catch (e) { return null; } }
 function _saveJson(key, v) { localStorage.setItem(key, JSON.stringify(v)); }
@@ -125,6 +170,7 @@ async function activateTab(idx) {
   if (d.searchQuery) $("searchBox").classList.remove("hidden");
   $("btnDocumentSearch").setAttribute("aria-expanded", String(!$("searchBox").classList.contains("hidden")));
   renderSearchPanel();
+  ReaderChrome.reveal();
   setUploadHidden(true);
   $("app").classList.remove("hidden");
   if (d.fitWidth || d.scale == null) d.scale = fitWidthScale(d);
@@ -235,6 +281,7 @@ function restoreReadingPosition(d, side) {
 
 function showLibrary() {
   persistCurrentProgress(); PaperLibrary.flush();
+  ReaderChrome.reveal();
   readerNotes.clearSelection();
   readerSearch.cancelJump();
   $("searchPanel").classList.add("hidden");
@@ -474,6 +521,7 @@ async function renderSingle() {
 
 /* ================= 对照（沉浸翻译）渲染 ================= */
 let duoRenderJob = null;
+let duoVisibilityTransition = null;
 const duoPaint = { original: null, translation: null };
 
 function cancelDuoRender() {
@@ -524,7 +572,9 @@ function publishDuoCanvas(side, source, vp, info, draw) {
 }
 
 async function renderDuo() {
-  const d = cur(); if (!d || state.mode !== "duo" || $("app").classList.contains("hidden")) return;
+  let d = cur(); if (!d || state.mode !== "duo" || $("app").classList.contains("hidden")) return;
+  if (duoVisibilityTransition) await duoVisibilityTransition;
+  d = cur(); if (!d || state.mode !== "duo" || $("app").classList.contains("hidden")) return;
   syncDuoControls(d);
   readerSearch.refresh(d);
   cancelDuoRender();
@@ -674,20 +724,50 @@ function wrapText(ctx, text, fs, maxW, firstIndent) {
   return lines;
 }
 
-// 文字和公式共享行盒：公式有真实宽度、基线上方高度和基线下方高度。
-// 原图只在绘制时裁取；缩放页面后会使用 PDF.js 新渲染的高分辨率原图。
+// 文字、局部样式和公式共享行盒。样式标记不占宽度；公式有真实宽度、
+// 基线上方高度和基线下方高度。原图只在绘制时裁取。
 function layoutInlineText(ctx, text, block, fs, maxW, firstIndent, meta, vp) {
   const formulas = new Map((block.inline_math || []).map((m) => [m.token, m]));
+  const styles = new Map((block.inline_styles || []).map((s) => [s.token, s]));
   const units = [];
-  const tokenRe = /__MATH_\d{4,}__/g;
+  const tokenRe = /__MATH_\d{4,}__|__STYLE_(\d{4,})_(OPEN|CLOSE)__/g;
+  const baseFont = ctx.font;
+  const family = String(baseFont).replace(/^.*?[\d.]+px\s+/, "") || "sans-serif";
+  const hasLocalStyles = styles.size > 0;
+  let activeStyle = { bold: hasLocalStyles ? false : !!block.bold,
+    italic: hasLocalStyles ? false : !!block.italic };
+  const styleStack = [];
+  const fontFor = (style) => (style.bold ? "bold " : "") + (style.italic ? "italic " : "") + fs + "px " + family;
+  const setFont = (style) => { ctx.font = fontFor(style); };
   let pos = 0, match;
   const pushText = (value) => {
-    for (const atom of textLayoutUnits(value, ctx, maxW)) units.push({ type: "text", text: atom });
+    setFont(activeStyle);
+    for (const atom of textLayoutUnits(value, ctx, maxW)) {
+      units.push({ type: "text", text: atom, bold: activeStyle.bold,
+        italic: activeStyle.italic, font: ctx.font });
+    }
   };
   while ((match = tokenRe.exec(String(text))) !== null) {
     pushText(String(text).slice(pos, match.index));
+    if (match[1]) {
+      const key = "__STYLE_" + match[1] + "__";
+      if (match[2] === "OPEN") {
+        const next = styles.get(key);
+        if (!next) {
+          ctx.font = baseFont;
+          throw new Error("局部样式信息缺失，请重新打开文档后重试：" + key);
+        }
+        styleStack.push(activeStyle);
+        activeStyle = { bold: !!next.bold, italic: !!next.italic };
+      } else {
+        activeStyle = styleStack.pop() || { bold: false, italic: false };
+      }
+      pos = match.index + match[0].length;
+      continue;
+    }
     const m = formulas.get(match[0]);
     if (!m || !m.bbox || !(m.font_size > 0)) {
+      ctx.font = baseFont;
       throw new Error("内联公式坐标缺失，请重新打开文档后重试：" + match[0]);
     }
     const padding = fs * 0.08;
@@ -719,12 +799,16 @@ function layoutInlineText(ctx, text, block, fs, maxW, firstIndent, meta, vp) {
   pushText(String(text).slice(pos));
   const lines = [];
   const newLine = (indent) => ({ runs: [], width: 0, indent, ascent: fs * 0.85, descent: fs * 0.35 });
+  const textWidth = (value, run) => {
+    ctx.font = run.font;
+    return ctx.measureText(value).width;
+  };
   let line = newLine(firstIndent || 0);
   const finishLine = () => {
     const last = line.runs[line.runs.length - 1];
     if (last && last.type === "text") {
       last.text = last.text.trimEnd();
-      const width = ctx.measureText(last.text).width;
+      const width = textWidth(last.text, last);
       line.width += width - last.width; last.width = width;
       if (!last.text) line.runs.pop();
     }
@@ -738,15 +822,16 @@ function layoutInlineText(ctx, text, block, fs, maxW, firstIndent, meta, vp) {
     if (!line.runs.length && unit.type === "text" && !unit.text.trim()) continue;
     let last = line.runs[line.runs.length - 1];
     const addedWidth = () => unit.type === "math" ? unit.width
-      : last && last.type === "text" ? ctx.measureText(last.text + unit.text).width - last.width
-      : ctx.measureText(unit.text).width;
+      : last && last.type === "text" && last.font === unit.font
+        ? textWidth(last.text + unit.text, unit) - last.width
+        : textWidth(unit.text, unit);
     let delta = addedWidth();
     if (line.width + delta > maxW - line.indent && line.runs.length) {
       finishLine(); last = null; delta = addedWidth();
       if (unit.type === "text" && !unit.text.trim()) continue;
     }
     if (!line.runs.length && delta > maxW - line.indent) line.indent = 0;
-    if (unit.type === "text" && last && last.type === "text") {
+    if (unit.type === "text" && last && last.type === "text" && last.font === unit.font) {
       last.text += unit.text; last.width += delta;
     } else {
       line.runs.push(Object.assign({}, unit, { width: delta }));
@@ -758,10 +843,12 @@ function layoutInlineText(ctx, text, block, fs, maxW, firstIndent, meta, vp) {
     }
   }
   if (line.runs.length) finishLine();
+  ctx.font = baseFont;
   return lines;
 }
 
 function drawInlineLine(ctx, line, x, baseline, src) {
+  const baseFont = ctx.font;
   let cursor = x;
   for (const run of line.runs) {
     if (run.type === "math") {
@@ -771,10 +858,12 @@ function drawInlineLine(ctx, line, x, baseline, src) {
           cursor + run.padding + slice.x, baseline + slice.y, slice.w, slice.h);
       }
     } else if (run.text.trim()) {
+      ctx.font = run.font || baseFont;
       ctx.fillText(run.text, cursor, baseline);
     }
     cursor += run.width;
   }
+  ctx.font = baseFont;
 }
 
 // 首页标题、作者和单位通常横跨双栏。它们必须从正文分栏计算中剔除，
@@ -864,7 +953,7 @@ function drawCoverHeader(ctx, blocks, map, meta, vp, scale, dpr, fam, src, measu
     const top = bottom ? Math.max(r.y, bottom + fs * 0.22) : r.y;
     ctx.font = (b.bold ? "bold " : "") + (b.italic ? "italic " : "") + fs + "px " + fam;
     ctx.fillStyle = "#1f2937";
-    const rich = !!(b.inline_math && b.inline_math.length);
+    const rich = !!((b.inline_math && b.inline_math.length) || (b.inline_styles && b.inline_styles.length));
     const lines = rich ? layoutInlineText(ctx, text, b, fs, maxW, 0, meta, vp)
       : wrapText(ctx, String(text), fs, maxW, 0);
     let baseline = top + fs;
@@ -1019,11 +1108,13 @@ function flowColumn(ctx, colRect, blocks, map, bodyFs, fam, scale, dpr, obstacle
     ctx.font = (b.bold ? "bold " : "") + (b.italic ? "italic " : "") + fs + "px " + fam;
     ctx.fillStyle = "#1f2937";
     const lh = fs * LINE_ZH;
-    const rich = !!(b.inline_math && b.inline_math.length);
+    const rich = !!((b.inline_math && b.inline_math.length) || (b.inline_styles && b.inline_styles.length));
     let lines = rich ? layoutInlineText(ctx, text, b, fs, colRect.w, 0, meta, vp)
       : wrapText(ctx, String(text), fs, colRect.w, 0);
     const citationContinuation = /^\s*(?:18|19|20)\d{2}[a-z]?\s*[;,)；，）]/.test(b.text || "");
-    const indent = (!isHeading && lines.length > 1 && !citationContinuation) ? fs * 2 : 0;
+    const sourceIndent = Math.max(0, Number(b.first_line_indent || 0) * scale * dpr);
+    const indent = (!isHeading && lines.length > 1 && !citationContinuation)
+      ? Math.min(sourceIndent, fs * 3, colRect.w * 0.2) : 0;
     if (indent) lines = rich ? layoutInlineText(ctx, text, b, fs, colRect.w, indent, meta, vp)
       : wrapText(ctx, String(text), fs, colRect.w, indent);
     for (let i = 0; i < lines.length; i++) {
@@ -1185,10 +1276,37 @@ function fitDuoScale(d, side) {
   return Math.max(0.25, Math.min(4, avail / meta.width));
 }
 
+function applyDuoOriginalVisibility(d) {
+  const collapsed = !d.duoShowOriginal;
+  $("duoView").querySelector(".duo-body").classList.toggle("original-collapsed", collapsed);
+  $("duoOriginalPane").inert = collapsed;
+  $("duoOriginalPane").setAttribute("aria-hidden", String(collapsed));
+  $("btnToggleOriginal").textContent = collapsed ? "显示原文" : "隐藏原文";
+  $("btnToggleOriginal").setAttribute("aria-expanded", String(!collapsed));
+}
+
+function waitForDuoVisibilityMotion() {
+  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return Promise.resolve();
+  const pane = $("duoOriginalPane");
+  return new Promise((resolve) => {
+    let finished = false;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      pane.removeEventListener("transitionend", onEnd);
+      clearTimeout(timer);
+      resolve();
+    };
+    const onEnd = (event) => {
+      if (event.target === pane && event.propertyName === "flex-grow") finish();
+    };
+    const timer = setTimeout(finish, 500);
+    pane.addEventListener("transitionend", onEnd);
+  });
+}
+
 function syncDuoControls(d) {
-  $("duoOriginalPane").classList.toggle("hidden", !d.duoShowOriginal);
-  $("btnToggleOriginal").textContent = d.duoShowOriginal ? "隐藏原文" : "显示原文";
-  $("btnToggleOriginal").setAttribute("aria-expanded", String(d.duoShowOriginal));
+  applyDuoOriginalVisibility(d);
   if (d.duoShowOriginal && (d.duoFitOriginal || d.duoOriginalScale == null)) {
     d.duoOriginalScale = fitDuoScale(d, "original");
   }
@@ -1216,13 +1334,29 @@ function fitDuoWidth(side) {
   renderDuo().then(persistCurrentProgress);
 }
 
-function toggleDuoOriginal() {
+async function toggleDuoOriginal() {
   const d = cur(); if (!d || state.mode !== "duo") return;
   persistCurrentProgress();
   d.duoShowOriginal = !d.duoShowOriginal;
   if (!d.duoShowOriginal && d.reading?.original) d.hiddenOriginalAnchor = { page: d.currentPage, anchor: d.reading.original };
   if (!d.duoShowOriginal) d.duoZoomTarget = "translation";
-  renderDuo().then(persistCurrentProgress);
+  cancelDuoRender();
+  const layoutJob = { doc: d, tasks: new Set(), layout: true };
+  duoRenderJob = layoutJob;
+  const motion = waitForDuoVisibilityMotion();
+  duoVisibilityTransition = motion;
+  $("btnToggleOriginal").disabled = true;
+  applyDuoOriginalVisibility(d);
+  try {
+    await motion;
+  } finally {
+    if (duoVisibilityTransition === motion) duoVisibilityTransition = null;
+    if (duoRenderJob === layoutJob) duoRenderJob = null;
+    $("btnToggleOriginal").disabled = false;
+  }
+  if (cur() !== d || state.mode !== "duo") return;
+  await renderDuo();
+  persistCurrentProgress();
 }
 
 function updateZoomLabel() {
@@ -1524,6 +1658,7 @@ function switchSidebar(tab) {
 let searchRun = 0;
 
 function openSearch() {
+  ReaderChrome.reveal();
   $("searchBox").classList.remove("hidden");
   $("btnDocumentSearch").setAttribute("aria-expanded", "true");
   $("searchInput").focus();
@@ -1675,6 +1810,7 @@ function handleSettingsKeydown(e) {
 async function init() {
   readerNotes.init({ getDoc: cur, getMode: () => state.mode, goToPage, toast });
   StorageManager.init({ toast });
+  ReaderChrome.init();
   // 上传 / 拖拽
   $("dropZone").addEventListener("click", () => $("fileInput").click());
   $("btnLibraryAdd").addEventListener("click", () => $("fileInput").click());
@@ -1733,6 +1869,13 @@ async function init() {
     if (cur() && state.mode === "duo" && !$("app").classList.contains("hidden")) renderDuo();
   }, 200));
   duoResize.observe(document.querySelector(".duo-body"));
+  const duoToolbarResize = new ResizeObserver((entries) => {
+    for (const entry of entries) {
+      const pane = entry.target.closest(".duo-pane");
+      if (pane) pane.style.setProperty("--duo-toolbar-height", `${Math.ceil(entry.target.getBoundingClientRect().height)}px`);
+    }
+  });
+  document.querySelectorAll(".duo-toolbar").forEach((toolbar) => duoToolbarResize.observe(toolbar));
 
   // 翻页
   $("btnPrev").addEventListener("click", () => goToPage(cur() ? cur().currentPage - 1 : 1));
@@ -1746,15 +1889,43 @@ async function init() {
   const syncSidebarToggle = () => {
     const collapsed = $("sidebar").classList.contains("collapsed");
     $("btnSidebar").setAttribute("aria-expanded", String(!collapsed));
-    $("btnSidebar").setAttribute("aria-controls", "sidebar");
-    $("btnSidebar").setAttribute("aria-label", collapsed ? "展开侧栏" : "收起侧栏");
-    $("btnSidebar").title = collapsed ? "展开侧栏" : "收起侧栏";
-    $("sidebar").inert = collapsed;
+    $("btnSidebar").setAttribute("aria-controls", "sidebarContent");
+    $("btnSidebar").setAttribute("aria-label", collapsed ? "展开文档导航" : "收起文档导航");
+    $("btnSidebar").title = collapsed ? "展开文档导航" : "收起文档导航";
+    $("sidebarContent").inert = collapsed;
+  };
+  let sidebarTransitionId = 0;
+  let sidebarTransitionTimer = 0;
+  const setSidebarCollapsed = (collapsed) => {
+    const sidebar = $("sidebar");
+    const transitionId = ++sidebarTransitionId;
+    clearTimeout(sidebarTransitionTimer);
+
+    // Pin the current rendered height before changing layout. This lets the
+    // full-height panel morph into the compact title capsule without an auto-height jump.
+    sidebar.style.height = `${sidebar.getBoundingClientRect().height}px`;
+    sidebar.style.alignSelf = "flex-start";
+    sidebar.getBoundingClientRect();
+    sidebar.classList.toggle("collapsed", collapsed);
+    syncSidebarToggle();
+
+    requestAnimationFrame(() => {
+      if (transitionId !== sidebarTransitionId) return;
+      const targetHeight = collapsed
+        ? Math.ceil($("sidebarControlCluster").getBoundingClientRect().bottom - sidebar.getBoundingClientRect().top + 2)
+        : Math.ceil($("main").getBoundingClientRect().height);
+      sidebar.style.height = `${targetHeight}px`;
+    });
+
+    sidebarTransitionTimer = setTimeout(() => {
+      if (transitionId !== sidebarTransitionId || sidebar.classList.contains("collapsed")) return;
+      sidebar.style.height = "";
+      sidebar.style.alignSelf = "";
+    }, 360);
   };
   syncSidebarToggle();
   $("btnSidebar").addEventListener("click", () => {
-    $("sidebar").classList.toggle("collapsed");
-    syncSidebarToggle();
+    setSidebarCollapsed(!$("sidebar").classList.contains("collapsed"));
   });
   document.querySelectorAll(".shead .s").forEach((s) => {
     s.addEventListener("click", () => switchSidebar(s.dataset.tab));

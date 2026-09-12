@@ -307,14 +307,23 @@ def _merge_lines(lines):
     for ln in lines:
         if blocks and _lines_mergeable(blocks[-1], ln):
             prev = blocks[-1]
+            if prev.get("_line_count", 1) == 1:
+                # Preserve the source paragraph's actual first-line offset.
+                # The renderer scales this PDF-space distance instead of adding
+                # a blanket two-character indent to every translated block.
+                prev["first_line_indent"] = round(max(0.0,
+                    float(prev.get("_first_line_x0", prev["bbox"][0])) - float(ln["bbox"][0])), 2)
+            prev["_line_count"] = prev.get("_line_count", 1) + 1
             # A bold inline lead-in may end mid-word. Joining its continuation
             # must not turn the entire following paragraph into a bold heading.
             prev["bold"] = (int(prev["bold"]) * len(prev["text"]) + int(ln["bold"]) * len(ln["text"])) > (len(prev["text"]) + len(ln["text"])) * .5
-            prev["translation_text"] = _join_paragraph_text(
+            prev["translation_text"], merged_styles = _join_styled_paragraph_text(
                 prev.get("translation_text", prev["text"]),
                 ln.get("translation_text", ln["text"]),
+                prev.get("inline_styles", []), ln.get("inline_styles", []),
             )
             prev["inline_math"] = prev.get("inline_math", []) + ln.get("inline_math", [])
+            prev["inline_styles"] = merged_styles
             prev["_source_block"] = ln.get("_source_block")
             # TeX/PDF 常在换行处插入排版连字符。英文单词续行时去掉它，
             # 例如 se- + quential -> sequential；其他情况仍按普通空格连接。
@@ -326,14 +335,50 @@ def _merge_lines(lines):
             p, b = prev["bbox"], ln["bbox"]
             prev["bbox"] = [min(p[0], b[0]), min(p[1], b[1]), max(p[2], b[2]), max(p[3], b[3])]
         else:
-            blocks.append(dict(ln))
+            item = dict(ln)
+            item["_line_count"] = 1
+            item["_first_line_x0"] = float(ln["bbox"][0])
+            blocks.append(item)
     return blocks
 
 
 def _join_paragraph_text(a, b):
-    if re.search(r"[A-Za-z]{2}-$", a) and re.match(r"[a-z]", b.lstrip()):
-        return a[:-1] + b.lstrip()
+    close = r"(?:__STYLE_\d{4,}_CLOSE__)*"
+    opened = r"(?:__STYLE_\d{4,}_OPEN__)*"
+    tail = re.search(rf"[A-Za-z]{{2}}-(?P<markers>{close})$", a)
+    head = re.match(rf"(?P<markers>{opened})[a-z]", b.lstrip())
+    if tail and head:
+        # Keep any style boundaries, but remove the PDF line-break hyphen and
+        # do not insert a space inside the reconstructed word.
+        cut = tail.end() - len(tail.group("markers")) - 1
+        return a[:cut] + tail.group("markers") + b.lstrip()
     return a + " " + b
+
+
+def _join_styled_paragraph_text(a, b, a_styles, b_styles):
+    """Join physical lines and coalesce adjacent runs with the same style."""
+    combined = list(a_styles) + list(b_styles)
+    left = re.search(r"__STYLE_(\d{4,})_CLOSE__$", a)
+    right = re.match(r"__STYLE_(\d{4,})_OPEN__", b.lstrip())
+    if left and right:
+        left_id, right_id = left.group(1), right.group(1)
+        style_by_id = {item["token"][8:-2]: item for item in combined}
+        after_open = b.lstrip()[right.end():]
+        left_style, right_style = style_by_id.get(left_id), style_by_id.get(right_id)
+        same_style = (left_style and right_style
+                      and bool(left_style.get("bold")) == bool(right_style.get("bold"))
+                      and bool(left_style.get("italic")) == bool(right_style.get("italic")))
+        if same_style:
+            left_close = f"__STYLE_{left_id}_CLOSE__"
+            right_close = f"__STYLE_{right_id}_CLOSE__"
+            left_part = a[:-len(left_close)]
+            broken_word = bool(re.search(r"[A-Za-z]{2}-$", left_part) and re.match(r"[a-z]", after_open))
+            if broken_word:
+                left_part = left_part[:-1]
+            right_part = after_open.replace(right_close, left_close, 1)
+            combined = [item for item in combined if item["token"] != f"__STYLE_{right_id}__"]
+            return left_part + ("" if broken_word else " ") + right_part, combined
+    return _join_paragraph_text(a, b), combined
 
 
 def _lines_mergeable(a, b):
@@ -364,9 +409,14 @@ def _lines_mergeable(a, b):
     incomplete = same_source and not re.search(r"[.!?]\s*$", a["text"])
     if abs(b["font_size"] - a["font_size"]) > (size * .2 if incomplete else .6):
         return False
-    # 样式不一致则不合并，避免「加粗标题」把「正文」带成加粗
+    # 局部粗体/斜体现在由 inline_styles 保存。同一 PDF 文本块里，较长的
+    # 首行或以冒号/句号收尾的加粗引导语仍属于后续段落；短标题则继续分块。
     broken_word = same_source and re.search(r"[A-Za-z]{2}-$", a["text"]) and re.match(r"[a-z]", b["text"])
-    if (a["bold"] != b["bold"] or a["italic"] != b["italic"]) and not broken_word:
+    style_continuation = (same_source and not a.get("_table_region") and not a.get("_algorithm_region") and (
+        len(re.findall(r"[A-Za-z\u3400-\u9fff]+", a["text"])) >= 8
+        or bool(re.search(r"[.:;：；。]\s*$", a["text"]))
+    ))
+    if (a["bold"] != b["bold"] or a["italic"] != b["italic"]) and not (broken_word or style_continuation):
         return False
     if a["color"] != b["color"] and (a.get("math") or a.get("skip") or b.get("math") or b.get("skip")):
         return False
@@ -452,6 +502,74 @@ def _span_is_math_base(span):
         return False
     return (_dedicated_math_span(span) or bool(re.fullmatch(r"[A-Za-z]", text))
             or any(c in MATH_CHARS for c in text))
+
+
+def _span_text_style(span):
+    """Return the visible prose style of a PDF span.
+
+    PyMuPDF's flags are the primary signal.  A small number of embedded fonts
+    omit those flags, so retain a conservative font-name fallback as well.
+    Single italic variables are filtered by ``_dedicated_math_span`` before
+    this style reaches the translation path.
+    """
+    flags = int(span.get("flags") or 0)
+    font = (span.get("font") or "").lower()
+    bold = bool(flags & 16) or bool(re.search(r"(?:bold|semibold|demibold|demi|black|heavy)", font))
+    italic = bool(flags & 2) or bool(re.search(r"(?:italic|oblique|slanted)", font))
+    return bold, italic
+
+
+def _inject_inline_styles(text, spans, style_offset=0):
+    """Wrap styled prose runs in protected markers without changing its text.
+
+    The markers travel through the translator and are removed only from the
+    plain-text API view.  The canvas renderer uses the accompanying metadata to
+    restore local bold/italic runs after Chinese reflow.
+    """
+    source = str(text or "")
+    matches = []
+    cursor = 0
+    ordered = sorted(spans, key=lambda s: (s.get("_bbox", fitz.Rect(s.get("bbox", (0, 0, 0, 0)))).x0,
+                                           s.get("_order", 0)))
+    for span in ordered:
+        bold, italic = _span_text_style(span)
+        phrase = re.sub(r"\s+", " ", span.get("text", "")).strip()
+        if (not phrase or not (bold or italic) or _dedicated_math_span(span)
+                or not any(ch.isalnum() for ch in phrase)):
+            continue
+        start = source.find(phrase, cursor)
+        if start < 0:
+            # Normalization can remove a space before punctuation.  Use a
+            # whitespace-tolerant match, but never guess across formula tokens.
+            pattern = re.escape(phrase).replace(r"\ ", r"\s+")
+            found = re.search(pattern, source[cursor:])
+            if not found:
+                continue
+            start = cursor + found.start()
+            end = cursor + found.end()
+        else:
+            end = start + len(phrase)
+        if "__MATH_" in source[start:end]:
+            cursor = end
+            continue
+        if (matches and matches[-1]["bold"] == bold and matches[-1]["italic"] == italic
+                and not source[matches[-1]["end"]:start].strip()):
+            # TeX frequently splits one visual title or author name into many
+            # adjacent spans (kerning, colour or font subsetting).  They are one
+            # semantic style run and should consume only one marker pair.
+            matches[-1]["end"] = end
+        else:
+            matches.append({"start": start, "end": end, "bold": bold, "italic": italic})
+        cursor = end
+    for number, item in enumerate(matches, start=style_offset):
+        item["token"] = f"__STYLE_{number:04d}__"
+    marked = source
+    for item in reversed(matches):
+        marked = (marked[:item["start"]] + item["token"][:-2] + "_OPEN__"
+                  + marked[item["start"]:item["end"]]
+                  + item["token"][:-2] + "_CLOSE__" + marked[item["end"]:])
+    styles = [{k: item[k] for k in ("token", "bold", "italic")} for item in matches]
+    return marked, styles
 
 
 def _format_script(kind, value):
@@ -609,6 +727,8 @@ def _merge_formula_continuations(blocks):
                 previous["translation_text"] = _join_paragraph_text(
                     previous.get("translation_text", ""), block["translation_text"])
                 previous["inline_math"] = before + candidates
+                previous["inline_styles"] = (previous.get("inline_styles", [])
+                                              + block.get("inline_styles", []))
                 previous["bbox"] = list(fitz.Rect(previous["bbox"]) | fitz.Rect(block["bbox"]))
                 continue
         can_join = (previous and not previous.get("math") and not previous.get("skip")
@@ -631,6 +751,8 @@ def _merge_formula_continuations(blocks):
                 tail["text"] += " " + following["text"]
                 previous["text"] = _join_paragraph_text(previous["text"], block["text"])
                 previous["translation_text"] += suffix
+                previous["inline_styles"] = (previous.get("inline_styles", [])
+                                              + block.get("inline_styles", []))
                 previous["bbox"] = list(fitz.Rect(previous["bbox"]) | fitz.Rect(block["bbox"]))
                 continue
         result.append(block)
@@ -788,6 +910,7 @@ def _merge_display_math_fragments(blocks, page_width):
             merged["text"] = " ".join(blocks[i].get("text", "") for i in ids)
             merged["translation_text"] = merged["text"]
             merged["inline_math"] = []
+            merged["inline_styles"] = []
             merged["math"] = True
             merged["skip"] = False
             merged["_whole_math"] = True
@@ -882,6 +1005,7 @@ def _merge_display_math_fragments(blocks, page_width):
         merged["text"] = " ".join(blocks[i].get("text", "") for i in ordered)
         merged["translation_text"] = merged["text"]
         merged["inline_math"] = []
+        merged["inline_styles"] = []
         merged["math"] = True
         merged["skip"] = False
         merged["_whole_math"] = True
@@ -928,7 +1052,7 @@ def _attach_formula_drawings(page, blocks):
                 part["bbox"] = [round(v, 3) for v in bounds]
 
 
-def _compose_visual_line(group, math_offset=0):
+def _compose_visual_line(group, math_offset=0, style_offset=0):
     """把视觉行排成可翻译文本，并把上下标规范化为 LaTeX 风格纯文本。"""
     spans = []
     bbox = None
@@ -952,7 +1076,7 @@ def _compose_visual_line(group, math_offset=0):
         # 竖排/旋转标签没有水平基线，不能套用上下标拼接或按 x 排序。
         text = re.sub(r"\s+", " ", "".join(s["text"] for s in spans)).strip()
         return {"spans": spans, "bbox": list(bbox), "text": text, "rotated": True,
-                "translation_text": text, "inline_math": []}
+                "translation_text": text, "inline_math": [], "inline_styles": []}
 
     weighted_sizes = []
     for s in spans:
@@ -1057,8 +1181,10 @@ def _compose_visual_line(group, math_offset=0):
     if re.sub(r"\s", "", restored) != re.sub(r"\s", "", out):
         # 复杂跨基线结构若不能可靠对齐，保留原来的文本通路，不能擅自调换正文顺序。
         translation_text, inline_math = out, []
+    translation_text, inline_styles = _inject_inline_styles(translation_text, spans, style_offset)
     return {"spans": spans, "bbox": list(bbox), "text": out,
-            "translation_text": translation_text if inline_math else out, "inline_math": inline_math}
+            "translation_text": translation_text if (inline_math or inline_styles) else out,
+            "inline_math": inline_math, "inline_styles": inline_styles}
 
 
 def _repair_radical_boxes(doc, page, raw, cache):
@@ -1242,17 +1368,19 @@ def _extract_page(doc, pno, glyph_bounds=None):
     _assemble_display_sources(d)
     lines = []
     math_offset = 0
+    style_offset = 0
     for source_block, b in enumerate(d.get("blocks", [])):
         if b.get("type") != 0:  # 只要文本块，图片块跳过
             continue
         visual_lines = []
         groups = [b["lines"]] if b.get("_whole_math") else _group_visual_lines(b.get("lines", []))
         for group in groups:
-            composed = _compose_visual_line(group, math_offset)
+            composed = _compose_visual_line(group, math_offset, style_offset)
             if composed:
                 if b.get("_whole_math"):
                     composed["bbox"] = list((fitz.Rect(composed["bbox"]) + (-.35, -.35, .35, .35)) & page.rect)
                 math_offset += len(composed["inline_math"])
+                style_offset += len(composed["inline_styles"])
                 visual_lines.append(composed)
         for ln in visual_lines:
             spans = ln.get("spans", [])
@@ -1308,6 +1436,7 @@ def _extract_page(doc, pno, glyph_bounds=None):
                 "text": text,
                 "translation_text": ln["translation_text"],
                 "inline_math": ln["inline_math"],
+                "inline_styles": ln["inline_styles"],
                 "_source_block": source_block,
                 **({"rotated": True} if ln.get("rotated") else {}),
             })
@@ -1340,6 +1469,8 @@ def _extract_page(doc, pno, glyph_bounds=None):
     for i, b in enumerate(blocks):
         b["id"] = i
         b.pop("_source_block", None)
+        b.pop("_line_count", None)
+        b.pop("_first_line_x0", None)
         b.pop("_whole_math", None)
         b.pop("_table_region", None)
         b.pop("_algorithm_region", None)
@@ -1349,9 +1480,11 @@ def _extract_page(doc, pno, glyph_bounds=None):
             b["display_math"] = True
         if b.get("math") or b.get("skip") or page.rotation:
             b.pop("inline_math", None)
+            b.pop("inline_styles", None)
             b.pop("translation_text", None)
-        elif not b.get("inline_math"):
+        elif not b.get("inline_math") and not b.get("inline_styles"):
             b.pop("inline_math", None)
+            b.pop("inline_styles", None)
             b.pop("translation_text", None)
     return {
         "page": pno,
@@ -1401,6 +1534,66 @@ def _page_lines(page):
     return lines
 
 
+def _table_caption_boxes(lines, page_width):
+    """Return complete, column-aware table caption boxes.
+
+    PDF producers frequently split one visual caption into several unrelated
+    text lines (and sometimes split a single line at a bold/plain span).  Using
+    only the first ``Table N`` line makes a long caption look far away from the
+    rules below it.  Keep left/right captions independent so two side-by-side
+    tables do not consume one another's text.
+    """
+    if not lines:
+        return []
+    mid = page_width / 2
+    boxes = []
+    for i, line in enumerate(lines):
+        if not TABLE_START_RE.match(line["text"]):
+            continue
+        start = fitz.Rect(line["bbox"])
+        # A caption wholly on one side of the page belongs to that column;
+        # otherwise it is a full-width caption.
+        if start.x1 <= mid + 6:
+            band = fitz.Rect(0, 0, mid + 6, float("inf"))
+        elif start.x0 >= mid - 6:
+            band = fitz.Rect(mid - 6, 0, page_width, float("inf"))
+        else:
+            band = fitz.Rect(0, 0, page_width, float("inf"))
+        box = fitz.Rect(start)
+        last_bottom = start.y1
+        base_size = float(line.get("size") or 10)
+        for other in lines[i + 1:]:
+            rect = fitz.Rect(other["bbox"])
+            # A neighbouring column may overlap the band by a few points near
+            # the gutter.  Classify by line centre instead of any intersection.
+            if not (band.x0 <= (rect.x0 + rect.x1) / 2 <= band.x1):
+                continue
+            if TABLE_START_RE.match(other["text"]):
+                break
+            gap = rect.y0 - last_bottom
+            # Caption lines are tightly led.  The slightly larger gap before a
+            # table header/rule terminates the caption without a language rule.
+            if gap > max(3.5, max(base_size, float(other.get("size") or 10)) * .58):
+                break
+            if other.get("bold") and float(other.get("size") or 10) > base_size + .8:
+                break
+            box |= rect
+            last_bottom = max(last_bottom, rect.y1)
+            if box.height > 150:
+                break
+        boxes.append((i, box))
+    return boxes
+
+
+def _table_caption_near(table, caption):
+    overlap = min(table.x1, caption.x1) - max(table.x0, caption.x0)
+    if overlap < min(table.width, caption.width) * .6:
+        return False
+    above_gap = table.y0 - caption.y1
+    below_gap = caption.y0 - table.y1
+    return (-8 <= above_gap <= 65) or (-8 <= below_gap <= 32)
+
+
 def _caption_regions(page, tables=None, algorithms=None):
     """以 Table/Figure/Algorithm 标题为锚点，按栏向下扫描，返回该区块的包围盒。
 
@@ -1418,30 +1611,20 @@ def _caption_regions(page, tables=None, algorithms=None):
     regions = []
     tables = _ruled_table_regions(page) if tables is None else tables
     algorithms = _ruled_algorithm_regions(page) if algorithms is None else algorithms
+    table_captions = dict(_table_caption_boxes(lines, page.rect.width))
     for i, ln in enumerate(lines):
         # 只处理表格/算法标题的区域；图注不在这里生成（避免向下扫过正文吞并段落）。
         # 无标点的 "Table N Title" 只有在附近已经检测到带横线的数值表时才成立。
-        caption = fitz.Rect(ln["bbox"])
+        caption = fitz.Rect(table_captions.get(i, ln["bbox"]))
         if ALGO_START_RE.match(ln["text"]) and any(abs(caption & r) >= abs(caption) * .8 for r in algorithms):
             continue  # Exact ruled boundary already covers the complete algorithm.
-        table = next((r for r in tables if TABLE_START_RE.match(ln["text"]) and
-                      min(r.x1, caption.x1) - max(r.x0, caption.x0) >= min(r.width, caption.width) * .6
-                      and (0 <= caption.y0 - r.y1 <= 32 or 0 <= r.y0 - caption.y1 <= 65)), None)
+        table = next((r for r in tables if TABLE_START_RE.match(ln["text"])
+                      and _table_caption_near(r, caption)), None)
         if not (TABLE_CAPTION_RE.match(ln["text"]) or ALGO_START_RE.match(ln["text"]) or table is not None):
             continue
         if table is not None:
-            # Table bounds are known: only collect tightly spaced caption lines.
-            # A below-table caption must never scan onward into the next paragraph.
-            for nb in lines[i + 1:]:
-                rect = fitz.Rect(nb["bbox"])
-                if abs(rect.x0 - caption.x0) > 12:
-                    continue
-                gap = rect.y0 - caption.y1
-                if (gap > max(3, ln["size"] * .65) or rect.intersects(table)
-                        or abs(nb["size"] - ln["size"]) > 1 or nb["bold"]):
-                    break
-                if gap >= -1:
-                    caption |= rect
+            # The complete caption was reconstructed column-wise above.  Keep
+            # it separate from the ruled data region so both remain protected.
             regions.append(list(caption))
             continue
         leftcol = ln["bbox"][0] < mid
@@ -1544,16 +1727,16 @@ def _figure_clip_regions(page, clips, graphics):
 
 
 def _ruled_table_regions(page):
-    """Caption + aligned horizontal rules + numeric rows identify open tables.
+    """Caption + aligned horizontal rules + repeated data rows identify open tables.
 
     Academic tables often have no vertical borders and their caption is below
     the data. Neither PDF table finders nor downward caption scans cover these.
     Require all three signals so charts, page headers and nearby prose stay out.
     """
     lines = _page_lines(page)
-    # Structural evidence below (aligned rules + numeric rows) makes the broad
+    # Structural evidence below (aligned rules + numeric/categorical rows) makes the broad
     # caption form safe here, including captions without a colon or full stop.
-    captions = [fitz.Rect(ln["bbox"]) for ln in lines if TABLE_START_RE.match(ln["text"])]
+    captions = [box for _, box in _table_caption_boxes(lines, page.rect.width)]
     if not captions:
         return []
     rules = []
@@ -1581,13 +1764,15 @@ def _ruled_table_regions(page):
             continue
         rect = fitz.Rect(min(r.x0 for r in group), group[0].y0 - 1,
                          max(r.x1 for r in group), group[-1].y1 + 1)
-        if not any(min(rect.x1, c.x1) - max(rect.x0, c.x0) >= min(rect.width, c.width) * .6
-                   and (0 <= c.y0 - rect.y1 <= 32 or 0 <= rect.y0 - c.y1 <= 65) for c in captions):
+        if not any(_table_caption_near(rect, c) for c in captions):
             continue
         numeric = [w for w in words if re.fullmatch(r"[−+\-]?\d+(?:\.\d+)?%?", w[4])
                    and rect.contains(fitz.Point((w[0] + w[2]) / 2, (w[1] + w[3]) / 2))]
+        categorical = [w for w in words
+                       if re.fullmatch(r"(?:✓|✔|☑|×|✗|✕|—|–|−|N/?A)", w[4], re.I)
+                       and rect.contains(fitz.Point((w[0] + w[2]) / 2, (w[1] + w[3]) / 2))]
         rows = []
-        for w in sorted(numeric, key=lambda w: w[1]):
+        for w in sorted(numeric + categorical, key=lambda w: w[1]):
             if not rows or abs(w[1] - rows[-1][0][1]) > 4:
                 rows.append([w])
             else:

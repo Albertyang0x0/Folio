@@ -25,7 +25,8 @@ from pydantic import BaseModel
 
 from exporter import build_translated_pdf
 from extraction import extract_pages
-from translator import translate_segments, _placeholder_order, TranslationError
+from translator import (translate_segments, _placeholder_order, _style_marker_order,
+                        _valid_style_markup, _strip_style_markers, TranslationError)
 from library import PaperLibrary, valid_hash
 
 if getattr(sys, "frozen", False):
@@ -60,8 +61,8 @@ async def _no_cache_static(request, call_next):
 
 MAX_PDF = 80 * 1024 * 1024
 CHUNK_CHARS = 6000  # 每次请求最多送这么多字符去翻译
-EXTRACT_VER = 20  # 长公式按编号、栏边界与正文间隔整体合并
-PROMPT_VER = 6    # 新校验兼容已有合格译文；保留版本以迁移内容未变的页缓存
+EXTRACT_VER = 22  # 保留原文段落边界及段内粗体/斜体区间
+PROMPT_VER = 7    # 翻译协议保护并校验成对的局部样式标记
 
 
 class TranslateReq(BaseModel):
@@ -255,7 +256,9 @@ def _re_extract(pdf_hash, pdf_data=None, file_name="document.pdf"):
 
 def _translation_signature(page):
     return [(b["text"], b.get("translation_text", b["text"]), bool(b.get("math")), bool(b.get("skip")),
-             [(m["token"], m["text"]) for m in b.get("inline_math", [])])
+             [(m["token"], m["text"]) for m in b.get("inline_math", [])],
+             [(s["token"], bool(s.get("bold")), bool(s.get("italic")))
+              for s in b.get("inline_styles", [])])
             for b in page["blocks"]]
 
 
@@ -383,6 +386,7 @@ def _translation_blocks(blocks, translations):
         plain = translated
         for formula in block.get("inline_math", []):
             plain = plain.replace(formula["token"], formula["text"])
+        plain = _strip_style_markers(plain)
         item = {"id": block["id"], "text": plain}
         if plain != translated:
             item["rich_text"] = translated
@@ -394,6 +398,8 @@ def _valid_formula_tokens(blocks, translations):
     return (isinstance(translations, list) and len(blocks) == len(translations) and all(
         isinstance(t, str) and bool(t.strip())
         and Counter(m["token"] for m in b.get("inline_math", [])) == Counter(_placeholder_order(t))
+        and Counter(_style_marker_order(b.get("translation_text", b.get("text", "")))) == Counter(_style_marker_order(t))
+        and _valid_style_markup(t)
         for b, t in zip(blocks, translations)))
 
 

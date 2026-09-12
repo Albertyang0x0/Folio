@@ -17,6 +17,7 @@ SYSTEM_PROMPT = """You are a professional academic paper translator. Translate E
 - Keep ONLY the following in their original form: standalone math symbols and variables, formulas, numbers, units, citation markers, URLs, and proper names.
 - Tokens such as __MATH_0001__ are protected inline formulas. Preserve every token and its occurrence count exactly. You may move a token with its associated phrase to follow natural target-language grammar. Never translate, rename, split, duplicate, or delete tokens.
 - Tokens such as __CITE_0001__ are protected citations. Copy them exactly once, in order, at their original positions in the sentence. Never translate author names, "et al.", years, or citation punctuation.
+- Paired markers such as __STYLE_0001_OPEN__ and __STYLE_0001_CLOSE__ preserve the original bold/italic range. Keep each pair exactly once around the translation of the enclosed phrase. Never translate, rename, cross, duplicate, or delete these markers.
 - When a sentence contains an inline math symbol, translate ALL the surrounding English words into {target} and keep ONLY the symbol itself where it appears. Example: "strictly sorted by score γ negatively impacts Local Diversity" -> "严格按分数 γ 排序会对局部多样性产生负面影响".
 - Do NOT translate pseudocode, code fragments, or tabular data — keep them exactly as-is.
 - Keep well-known method/dataset names (e.g. STR, SAW, Local Diversity) in English, but translate the descriptive words around them.
@@ -151,6 +152,7 @@ async def _call(client, settings, target, segments, extra_hint=""):
 _EN_RUN = re.compile(r"\b[A-Za-z][A-Za-z'-]*\s+[A-Za-z][A-Za-z'-]*\s+[A-Za-z][A-Za-z'-]*\s+[A-Za-z][A-Za-z'-]*\b")
 _CJK = re.compile(r"[\u3400-\u9fff]")
 _PLACEHOLDER = re.compile(r"__MATH_\d{4,}__")
+_STYLE_MARKER = re.compile(r"__STYLE_(\d{4,})_(OPEN|CLOSE)__")
 _SCRIPT = r"(?:\{[^{}\n]{1,40}\}|[A-Za-z0-9]+)"
 _INLINE_MATH = re.compile(
     rf"(?:[A-Za-z]_(?:{_SCRIPT})(?:\^(?:{_SCRIPT}))?"
@@ -177,7 +179,7 @@ def _mask_inline_math(text):
         return token
 
     parts, pos = [], 0
-    for match in re.finditer(r"__(?:MATH|CITE)_\d{4,}__", source):
+    for match in re.finditer(r"__(?:(?:MATH|CITE)_\d{4,}|STYLE_\d{4,}_(?:OPEN|CLOSE))__", source):
         parts.append(_INLINE_MATH.sub(repl, source[pos:match.start()]))
         parts.append(match.group(0))
         pos = match.end()
@@ -196,6 +198,26 @@ def _placeholder_order(text):
     return _PLACEHOLDER.findall(text or "")
 
 
+def _style_marker_order(text):
+    return [match.group(0) for match in _STYLE_MARKER.finditer(text or "")]
+
+
+def _valid_style_markup(text):
+    """Accept reordered style ranges, but reject missing/crossed marker pairs."""
+    stack = []
+    for match in _STYLE_MARKER.finditer(text or ""):
+        number, action = match.groups()
+        if action == "OPEN":
+            stack.append(number)
+        elif not stack or stack.pop() != number:
+            return False
+    return not stack
+
+
+def _strip_style_markers(text):
+    return _STYLE_MARKER.sub("", text or "")
+
+
 def _looks_like_name_list(text):
     words = re.findall(r"[A-Za-z][A-Za-z.'-]*", text or "")
     separators = (text or "").count(",")
@@ -209,7 +231,7 @@ def _looks_like_name_list(text):
 
 def _is_nontranslatable(text, target):
     has_formula = bool(_PLACEHOLDER.search(text or ""))
-    text = CITE_TOKEN.sub(" ", _PLACEHOLDER.sub(" ", text or "")).strip()
+    text = _strip_style_markers(CITE_TOKEN.sub(" ", _PLACEHOLDER.sub(" ", text or ""))).strip()
     # Math operators may use the same Roman font as prose. Only exempt them
     # when an extracted formula is present, never arbitrary English sentences.
     if has_formula and all(w.lower() in {"relu", "softmax", "sigmoid", "tanh", "log", "exp", "max", "min", "sin", "cos"}
@@ -229,7 +251,7 @@ def _is_nontranslatable(text, target):
 
 
 def _strip_allowed_english(text):
-    out = CITE_TOKEN.sub(" ", _PLACEHOLDER.sub(" ", text or ""))
+    out = _strip_style_markers(CITE_TOKEN.sub(" ", _PLACEHOLDER.sub(" ", text or "")))
     out = re.sub(r"https?://\S+|www\.\S+|\S+@\S+", " ", out, flags=re.I)
     out = re.sub(r"\([^()]*\bet\s+al\.?[^()]*\)", " ", out, flags=re.I)
     return out
@@ -246,6 +268,9 @@ def _translation_issue(source, masked_source, translated, target):
         return "inline formula placeholders changed"
     if CITE_TOKEN.findall(masked_source) != CITE_TOKEN.findall(translated):
         return "citation placeholders changed"
+    if (Counter(_style_marker_order(masked_source)) != Counter(_style_marker_order(translated))
+            or not _valid_style_markup(translated)):
+        return "style markers changed"
     chinese_target = "中文" in target or "chinese" in target.lower()
     if chinese_target and not _is_nontranslatable(source, target):
         if not _CJK.search(translated):
@@ -305,6 +330,7 @@ async def translate_segments(settings, segments, target="简体中文"):
                     failed.append(i)
                     messages = {"inline formula placeholders changed": ("formula_tokens", "公式标记缺失、重复或被改写"),
                                 "citation placeholders changed": ("citation_tokens", "引用标记被改写或顺序改变"),
+                                "style markers changed": ("style_tokens", "粗体或斜体标记缺失、重复或错配"),
                                 "empty translation": ("empty_translation", "翻译结果为空"),
                                 "translation contains no Chinese": ("untranslated", "正文未被翻译为中文"),
                                 "translation still contains an English clause": ("untranslated", "译文仍残留未翻译的英文语句")}
@@ -321,7 +347,8 @@ async def translate_segments(settings, segments, target="简体中文"):
             hint = (
                 "\n\nIMPORTANT: The previous answer failed quality validation. Translate every "
                 f"English sentence and clause into {target}. Copy every __MATH_0000__ and __CITE_0000__ token "
-                "with unchanged occurrence counts. Math may move with its phrase; preserve citation order. Return all requested IDs exactly once."
+                "with unchanged occurrence counts. Keep every __STYLE_0000_OPEN__/__STYLE_0000_CLOSE__ pair "
+                "around its translated phrase. Math may move with its phrase; preserve citation order. Return all requested IDs exactly once."
             )
             failed = await attempt(failed, hint)
 
@@ -329,7 +356,7 @@ async def translate_segments(settings, segments, target="简体中文"):
         for i in failed:
             still_bad = await attempt([i], (
                 "\n\nFINAL RETRY: Return a complete translation, not the English source. "
-                "Preserve the math and citation placeholders exactly."
+                "Preserve the math, citation, and paired style placeholders exactly."
             ))
             if still_bad:
                 final_failed.append(i)

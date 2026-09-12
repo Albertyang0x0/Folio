@@ -15,7 +15,8 @@
 <!-- ============ 主应用 ============ -->
 <div id="app" class="hidden">
 
-  <!-- 顶栏 -->
+  <!-- 顶栏：由沉浸阅读按钮折叠，释放出的高度交还给阅读区 -->
+  <div id="readerChrome" class="reader-chrome">
   <header id="topbar">
     <div class="reader-documentbar">
     <div class="brand" role="img" aria-label="阅屿 · Folio" title="阅屿 · Folio">
@@ -35,9 +36,6 @@
 
     <div class="reader-toolstrip">
     <div class="reader-view-tools">
-      <button id="btnSidebar" class="sidebar-toggle" title="收起/展开侧栏" aria-label="收起或展开文档导航" aria-controls="sidebar" aria-expanded="true"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M9 4v16M6 8h.01M6 12h.01"/></svg><span>导航</span></button>
-      <div class="toolbar-divider" aria-hidden="true"></div>
-      <span class="tool-label">阅读视图</span>
       <div class="vseg" id="viewSeg" data-active-mode="continuous" role="group" aria-label="阅读模式">
         <button class="v active" data-mode="continuous">连续</button>
         <button class="v" data-mode="single">单页</button>
@@ -71,19 +69,30 @@
     <button class="btn small hidden" id="readerSaveStatus" aria-live="polite" title="阅读状态保存情况"></button>
     </div>
   </header>
+  </div>
 
   <div id="main">
     <!-- 左侧栏 -->
     <aside id="sidebar">
-      <div class="sidebar-caption"><span>文档导航</span><span lang="en">CONTENTS</span></div>
-      <div class="shead">
-        <button class="s active" data-tab="thumbs">缩略图</button>
-        <button class="s" data-tab="outline">目录</button>
-        <button class="s" data-tab="bookmarks">书签</button>
+      <div id="sidebarControlCluster" class="sidebar-control-cluster">
+        <button id="btnSidebar" class="sidebar-caption" title="收起文档导航" aria-label="收起文档导航" aria-controls="sidebarContent" aria-expanded="true">
+          <span>文档导航</span><span lang="en">CONTENTS</span>
+          <svg class="ui-icon sidebar-collapse-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m14 6-6 6 6 6"/></svg>
+        </button>
+        <button class="icon reader-chrome-toggle" id="btnReaderChrome" title="收起顶部导航" aria-label="收起顶部导航" aria-controls="readerChrome" aria-expanded="true">
+          <svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 15 6-6 6 6"/></svg>
+        </button>
       </div>
-      <div id="thumbsPanel" class="spanel"></div>
-      <div id="outlinePanel" class="spanel hidden"></div>
-      <div id="bookmarksPanel" class="spanel hidden"></div>
+      <div id="sidebarContent" class="sidebar-content">
+        <div class="shead">
+          <button class="s active" data-tab="thumbs">缩略图</button>
+          <button class="s" data-tab="outline">目录</button>
+          <button class="s" data-tab="bookmarks">书签</button>
+        </div>
+        <div id="thumbsPanel" class="spanel"></div>
+        <div id="outlinePanel" class="spanel hidden"></div>
+        <div id="bookmarksPanel" class="spanel hidden"></div>
+      </div>
     </aside>
 
     <!-- 阅读区 -->
