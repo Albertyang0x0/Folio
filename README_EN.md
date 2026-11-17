@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img alt="Platform" src="https://img.shields.io/badge/platform-Windows-1d4e73?style=flat-square">
+  <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS-1d4e73?style=flat-square">
   <img alt="Python" src="https://img.shields.io/badge/Python-3.9%2B-3776ab?style=flat-square&logo=python&logoColor=white">
   <img alt="Local first" src="https://img.shields.io/badge/data-local--first-2b7a78?style=flat-square">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-5b6b82?style=flat-square">
@@ -105,7 +105,21 @@ The portable edition includes its own Python runtime, so end users do not need t
 
 > Do not run Folio directly from the ZIP preview. Unsigned open-source builds may trigger Windows SmartScreen; compare the file against the SHA-256 published with the Release before continuing.
 
-### Run from source
+### macOS desktop edition
+
+On your Mac, install Python 3.10+ (3.12 recommended) and the Xcode Command Line Tools. Run `./build_macos.sh` from the project root to produce `dist/Folio.app` and a ZIP for the architecture of the Python interpreter, such as `dist/Folio-macOS-arm64.zip`. Double-click `Folio.app` to run it with the bundled Python runtime.
+
+The library, caches, and diagnostic logs default to `~/Library/Application Support/Folio`. Settings, notes, and bookmarks use macOS WebKit storage. See the [macOS release guide](docs/macos-release.md) for Developer ID signing, Apple notarization, and in-app updates.
+
+To run the macOS desktop window from source:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r backend/requirements-desktop.txt
+.venv/bin/python backend/desktop.py
+```
+
+### Run the development server on Windows
 
 Requirements: Windows and Python 3.9+. Python 3.10 or later is recommended.
 

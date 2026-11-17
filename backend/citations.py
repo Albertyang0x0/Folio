@@ -5,9 +5,9 @@ TOKEN = re.compile(r"__CITE_\d{4,}__")
 YEAR = r"(?:18|19|20)\d{2}[a-z]?(?:\s*,\s*(?:(?:18|19|20)\d{2})?[a-z])?(?![A-Za-z0-9])"
 # Names may contain accents, particles and hyphens. Exclude common prose prefixes.
 NAME = r"(?!(?:See|In|By|From|Following|Unlike|The|This|Figure|Table|Section)\b)[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ'’\-]*"
-PERSON = rf"{NAME}(?:\s+(?:{NAME}|van|von|de|del|der|den|da|di)){{0,3}}"
+PERSON = rf"(?:(?:van|von|de|del|der|den|da|di)\s+)?{NAME}(?:\s+(?:{NAME}|van|von|de|del|der|den|da|di)){{0,3}}"
 AUTHORS = rf"{PERSON}(?:\s+et\s+al\.?|(?:,\s*{PERSON})*(?:,?\s+(?:and|&)\s+{PERSON})?)"
-AUTHOR_YEAR = rf"{AUTHORS}\s*,\s*{YEAR}"
+AUTHOR_YEAR = rf"{AUTHORS}(?:\s*,\s*|\s+){YEAR}"
 ENTRY = re.compile(rf"{AUTHOR_YEAR}")
 NARRATIVE = re.compile(rf"\b{AUTHORS}\s*\(\s*{YEAR}(?:\s*[,;]\s*{YEAR})*\s*\)")
 NUMBERED = re.compile(r"\[\s*\d+(?:\s*[,;–—\-]\s*\d+)*\s*\]")

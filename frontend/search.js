@@ -75,9 +75,7 @@ const readerSearch = (() => {
     const surface = surfaces.get(host);
     if (!surface) return;
     surfaces.delete(host);
-    if (surface.task) surface.task.cancel();
     surface.layer.remove();
-    if (surface.ownedText) surface.ownedText.remove();
   }
 
   function attach(host, doc, page, content, textDivs) {
@@ -90,13 +88,57 @@ const readerSearch = (() => {
     draw(surface); finishJump();
   }
 
+  function matchKey(match) {
+    return match.key ?? [match.scope, match.page, match.blockId, match.idx, match.end].join(":");
+  }
+
+  function addHighlight(surface, bounds, match, range) {
+    const key = matchKey(match);
+    const active = surface.doc.searchMatch && matchKey(surface.doc.searchMatch) === key;
+    const rects = range.getClientRects ? range.getClientRects() : [range];
+    for (const rect of rects) {
+      if (rect.width < 0.2 || rect.height < 0.2) continue;
+      const mark = document.createElement("span");
+      mark.className = "search-hit" + (active ? " current" : "");
+      mark.dataset.matchKey = key;
+      Object.assign(mark.style, {
+        left: (rect.left - bounds.left) / bounds.width * 100 + "%",
+        top: (rect.top - bounds.top) / bounds.height * 100 + "%",
+        width: rect.width / bounds.width * 100 + "%", height: rect.height / bounds.height * 100 + "%",
+      });
+      surface.layer.append(mark);
+    }
+  }
+
   function draw(surface) {
-    const { doc, host, layer, index, textDivs } = surface;
+    const { doc, host, layer, index, textDivs, translation } = surface;
     layer.replaceChildren();
-    if (!index || !host.getClientRects().length) return;
+    if (!host.getClientRects().length) return;
     const bounds = host.getBoundingClientRect();
     if (!bounds.width || !bounds.height) return;
-    for (const match of doc.searchResults.filter((item) => item.page === surface.page)) {
+    for (const match of doc.searchResults.filter((item) => item.page === surface.page &&
+      (item.scope === "translation") === Boolean(translation))) {
+      if (translation) {
+        const block = translation.get(match.blockId);
+        if (!block) continue;
+        const count = layer.childElementCount;
+        for (const { span, offsets } of block.spans) {
+          const first = offsets.findIndex((offset) => offset >= match.idx && offset < match.end);
+          if (first < 0) continue;
+          let last = first + 1;
+          while (last < offsets.length && (offsets[last] == null || offsets[last] < match.end)) last++;
+          const range = document.createRange();
+          range.setStart(span.firstChild, first);
+          range.setEnd(span.firstChild, last);
+          addHighlight(surface, bounds, match, range);
+        }
+        if (count === layer.childElementCount) {
+          const r = block.bounds;
+          addHighlight(surface, bounds, match, { left: bounds.left + r.left, top: bounds.top + r.top,
+            width: r.right - r.left, height: r.bottom - r.top });
+        }
+        continue;
+      }
       index.segments.forEach((segment, i) => {
         const from = Math.max(segment.start, match.start), to = Math.min(segment.end, match.end);
         const span = textDivs[i];
@@ -104,18 +146,7 @@ const readerSearch = (() => {
         const range = document.createRange();
         range.setStart(span.firstChild, from - segment.start);
         range.setEnd(span.firstChild, to - segment.start);
-        for (const rect of range.getClientRects()) {
-          if (rect.width < 0.2 || rect.height < 0.2) continue;
-          const mark = document.createElement("span");
-          mark.className = "search-hit" + (doc.searchMatch?.key === match.key ? " current" : "");
-          mark.dataset.matchKey = match.key;
-          Object.assign(mark.style, {
-            left: (rect.left - bounds.left) / bounds.width * 100 + "%",
-            top: (rect.top - bounds.top) / bounds.height * 100 + "%",
-            width: rect.width / bounds.width * 100 + "%", height: rect.height / bounds.height * 100 + "%",
-          });
-          layer.append(mark);
-        }
+        addHighlight(surface, bounds, match, range);
       });
     }
   }
@@ -126,7 +157,7 @@ const readerSearch = (() => {
   }
 
   function select(doc, match) {
-    pendingJump = { doc, key: match.key };
+    pendingJump = { doc, key: matchKey(match) };
     refresh(doc);
   }
 
@@ -144,30 +175,63 @@ const readerSearch = (() => {
     }
   }
 
-  // The comparison view has no selectable text layer; create an invisible measuring layer on its original side only.
-  async function mountOriginal(host, doc, page, viewport) {
-    detach(host);
-    const text = document.createElement("div"), layer = document.createElement("div");
-    text.className = "pdf-text-layer search-text-layer"; text.setAttribute("aria-hidden", "true");
-    text.style.setProperty("--scale-factor", viewport.scale);
-    layer.className = "search-layer"; layer.setAttribute("aria-hidden", "true");
-    host.append(text, layer);
-    const surface = { host, doc, page: page.pageNumber - 1, layer, ownedText: text, textDivs: [] };
-    surfaces.set(host, surface);
-    try {
-      const content = await page.getTextContent();
-      if (surfaces.get(host) !== surface) return;
-      surface.task = pdfjsLib.renderTextLayer({ textContentSource: content, container: text, viewport, textDivs: surface.textDivs, isOffscreenCanvasSupported: false });
-      await surface.task.promise;
-      if (surfaces.get(host) !== surface) return;
-      surface.task = null; surface.index = buildSearchIndex(content);
-      draw(surface); finishJump();
-    } catch (error) {
-      if (surfaces.get(host) === surface && error.name !== "AbortException") {
-        console.error("Search text layer", error); toast("本页搜索高亮加载失败", 4000);
+  // Canvas wraps and trims whitespace. Index the remaining characters back to
+  // the corresponding offsets in the original translation returned by the API.
+  function compact(text) {
+    const offsets = [];
+    let result = "";
+    for (let i = 0; i < text.length; i++) {
+      if (!/\s/u.test(text[i])) {
+        result += text[i];
+        offsets.push(i);
       }
     }
+    return { text: result, offsets };
   }
 
-  return { find, attach, detach, mountOriginal, refresh, select, cancelJump: () => { pendingJump = null; } };
+  function attachTranslation(host, doc, page, textLayer, layout, blocks) {
+    detach(host);
+    const layer = document.createElement("div");
+    layer.className = "search-layer";
+    layer.setAttribute("aria-hidden", "true");
+    const translation = new Map();
+    const plain = new Map(blocks.map((block) => [block.id, compact(block.text)]));
+    const content = document.createDocumentFragment();
+    for (const [id, bounds] of layout) {
+      const block = document.createElement("div");
+      block.className = "duo-text-block";
+      const spans = [], source = plain.get(id);
+      let cursor = 0;
+      for (const runs of bounds.lines) {
+        const line = document.createElement("div");
+        line.className = "duo-text-line";
+        for (const run of runs) {
+          if (!(run.naturalWidth > 0)) continue;
+          const span = document.createElement("span");
+          span.textContent = run.text;
+          Object.assign(span.style, {
+            font: run.font, lineHeight: run.height + "px", top: run.top + "px", left: run.left + "px",
+            transform: "scaleX(" + run.width / run.naturalWidth + ")",
+          });
+          line.append(span);
+          const value = compact(run.text);
+          const start = source?.text.indexOf(value.text, cursor) ?? -1;
+          if (value.text && start >= 0) {
+            const offsets = new Array(run.text.length);
+            for (const [i, offset] of value.offsets.entries()) offsets[offset] = source.offsets[start + i];
+            spans.push({ span, offsets });
+            cursor = start + value.text.length;
+          }
+        }
+        block.append(line);
+      }
+      content.append(block);
+      translation.set(id, { spans, bounds });
+    }
+    textLayer.replaceChildren(content);
+    host.append(layer);
+    surfaces.set(host, { host, doc, page, layer, translation });
+  }
+
+  return { find, attach, attachTranslation, detach, refresh, select, cancelJump: () => { pendingJump = null; } };
 })();

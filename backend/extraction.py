@@ -14,7 +14,7 @@ MATH_CHARS = set("∑∫∏∂√∇∞∈∉⊂⊆∀∃≤≥≠±×÷⋅→�
                 "αβγδεζηθικλμνξοπρστυφχψωΓΔΘΛΞΠΣΦΨΩ⋆∗∴∵∘∙†‡")
 # 常见数学字体名（LaTeX/Word 数学模式专用字体）
 MATH_FONTS = ("cmmi", "cmsy", "cmex", "msam", "msbm", "mtmi", "mtsyn", "txsy",
-              "latinmodernmath", "xchartermath", "libertinusmath", "newtxmath",
+              "latinmodernmath", "lmmath", "xchartermath", "libertinusmath", "newtxmath",
               "texgyretermesmath", "asana math", "firamath", "xits", "stix",
               "cambria math", "cambriamath", "mathjax")
 LATEX_RE = re.compile(r"\\[a-zA-Z]+")
@@ -25,16 +25,17 @@ ALGO_START_RE = re.compile(r"^\s*(Algorithm|Alg\.)\s*\d+", re.I)
 # 严格形式仍要求其后有冒号/句点/破折号，避免匹配 "Table 2 summarizes..."。
 TABLE_NUMBER_PATTERN = r"(?:\d+|[IVXLCDM]+)"
 TABLE_CAPTION_RE = re.compile(
-    rf"^\s*(Table|Tab\.)\s*{TABLE_NUMBER_PATTERN}\s*[:.\u00b7\u2013\u2014]", re.I)
+    rf"^\s*(Table|Tab\.)\s*{TABLE_NUMBER_PATTERN}\s*[:.|\u00b7\u2013\u2014]", re.I)
 # 有些模板在编号后不加冒号或句点。这个宽松形式只能与真实横线/数值网格
 # 联合使用，不能单独作为表格依据，否则 "Table 2 summarizes..." 会误报。
 TABLE_START_RE = re.compile(rf"^\s*(Table|Tab\.)\s*{TABLE_NUMBER_PATTERN}\b", re.I)
 # 图注：要求 "Figure N" 后跟冒号/句点/破折号
-FIG_CAPTION_RE = re.compile(r"^\s*(Figure|Fig\.)\s*\d+\s*[:.\u00b7\u2013\u2014]", re.I)
+FIG_CAPTION_RE = re.compile(r"^\s*(Figure|Fig\.)\s*\d+\s*[:.|\u00b7\u2013\u2014]", re.I)
 # 参考文献：引文编号 [1] / [1,2] / [1-3] 起始
 CITE_RE = re.compile(r"^\[[\d,\s\-\u2013]+\]")
-REF_HEAD_RE = re.compile(r"^\s*References?\s*$", re.I)
+REF_HEAD_RE = re.compile(r"^\s*R\s*e\s*f\s*e\s*r\s*e\s*n\s*c\s*e\s*s?\s*$", re.I)
 REF_MARK_RE = re.compile(r"\b(?:arXiv|CoRR|doi:|ISBN)\b", re.I)
+PROSE_CLAUSE_RE = re.compile(r"\b(?:where|with|when|which|that|the|each|these|their|incoming|experts|cores|served|retains|denotes|defined|minimize|given|such)\b", re.I)
 
 
 def _is_function_definition(text, font):
@@ -47,6 +48,12 @@ def _is_math_line(text, font):
     syms = sum(1 for c in text if c in MATH_CHARS)
     alnum = sum(1 for c in text if c.isalnum())
     words = re.findall(r"[A-Za-z][A-Za-z'\-]{1,}", text)
+    if PROSE_CLAUSE_RE.search(text):
+        return False
+    if (any(k in (font or "").lower() for k in MATH_FONTS)
+            and (syms or EQUATION_RE.search(text))
+            and not re.search(r"\b(?:the|is|are|we|of|for|and|with|where|in|to|this|that|from|by|as)\b", text, re.I)):
+        return True
     # Roman TeX fonts also spell operator names (MultiHead, Concat, Attention).
     # A function definition is not prose merely because it contains four words.
     if _is_function_definition(text, font):
@@ -164,6 +171,7 @@ def _detect_table_cells(lines, page_width):
     max_w = page_width * 0.6
     cell = [k for k, ln in enumerate(lines)
             if not (ln.get("skip") or ln.get("math"))
+            and not (TABLE_CAPTION_RE.match(ln["text"]) or FIG_CAPTION_RE.match(ln["text"]))
             and (ln["bbox"][3] - ln["bbox"][1]) < 30
             and (ln["bbox"][2] - ln["bbox"][0]) < max_w
             and len(ln["text"]) < 40]
@@ -214,6 +222,10 @@ def _detect_table_cells(lines, page_width):
     for ids in comps.values():
         if len(ids) < 6:
             continue
+        data_cells = [lines[cell[i]] for i in ids
+                      if re.fullmatch(r"[\s\d.,%+−–-]+|yes|no|N/?A", lines[cell[i]]["text"], re.I)]
+        if len(data_cells) < 3:
+            continue
         ncols = len(set(col_of[lines[cell[i]]["bbox"][0]] for i in ids))
         nrows = len(set(row_of[lines[cell[i]]["bbox"][1]] for i in ids))
         if not (2 <= ncols <= 16 and nrows >= 3):
@@ -230,33 +242,11 @@ def _detect_table_cells(lines, page_width):
 
 
 def _mark_float_lines(lines, page_width):
-    """标记「表格」与「算法」行为 skip=True（不翻译、不擦除，保持原样）。
-
-    以 Table N: / Algorithm N 标题行为锚点，向下标记紧邻的密集短行；
-    再用结构化的网格检测补上表格单元格（含标题在表格下方的情形）。
-    """
+    """保护算法伪代码和表格单元格，图注和表注进入翻译队列。"""
     for i, ln in enumerate(lines):
         if ALGO_START_RE.match(ln["text"]):
             ln["skip"] = True
             _mark_region_below(lines, i, 80, page_width)
-        elif TABLE_CAPTION_RE.match(ln["text"]):
-            ln["skip"] = True
-            _mark_region_below(lines, i, 40, page_width)
-        elif FIG_CAPTION_RE.match(ln["text"]):
-            # 图注常跨多行；只沿紧邻、同字号、同起始位置的行继续，遇到正文间距即停。
-            ln["skip"] = True
-            prev_y1 = ln["bbox"][3]
-            for j in range(i + 1, len(lines)):
-                nb = lines[j]
-                gap = nb["bbox"][1] - prev_y1
-                if gap > max(5.0, ln["font_size"] * 0.65):
-                    break
-                if abs(nb["font_size"] - ln["font_size"]) > 0.6:
-                    break
-                if abs(nb["bbox"][0] - ln["bbox"][0]) > max(12.0, ln["font_size"] * 1.25):
-                    break
-                nb["skip"] = True
-                prev_y1 = max(prev_y1, nb["bbox"][3])
     for k in _detect_table_cells(lines, page_width):
         lines[k]["skip"] = True
 
@@ -266,8 +256,7 @@ def _unmark_body_paragraphs(blocks, page_width):
 
     某些正文段（如 "Implementation (Alg. 1)..."、"dataset D = {...} to derive..."）
     因靠近表格/图或含内联符号而被误保留。这里用「长文本 + 多个英文单词 + 非算法标签行」
-    识别正文段并取消保留；算法伪代码（Input/Output/Algorithm 等标签）、窄单元格、
-    图注/表注仍保留。
+    识别正文段并取消保留；算法伪代码（Input/Output/Algorithm 等标签）和窄单元格仍保留。
     """
     _label = re.compile(r"^\s*(Input|Output|Desc\.|Algorithm|Alg\.|while|for|if\s|return)", re.I)
     for b in blocks:
@@ -278,12 +267,13 @@ def _unmark_body_paragraphs(blocks, page_width):
         if b.get("_whole_math") or b.get("_table_region") or b.get("_algorithm_region"):
             continue
         t = b.get("text", "")
-        if _is_function_definition(t, b.get("font")):
+        if (_is_function_definition(t, b.get("font"))
+                or (b.get("math") and any(k in b.get("font", "").lower() for k in MATH_FONTS)
+                    and _is_math_line(t, b.get("font")))):
             continue  # Operator names are not prose words, even in long definitions.
         if len(t) < 40:
             continue  # 短块（单元格/公式/图注）保留
-        if (FIG_CAPTION_RE.match(t) or TABLE_CAPTION_RE.match(t)
-                or ALGO_START_RE.match(t)):
+        if ALGO_START_RE.match(t):
             continue
         if _label.match(t):
             continue  # 算法伪代码标签行保留
@@ -298,7 +288,26 @@ def extract_pages(doc):
     glyph_bounds = {}
     pages = [_extract_page(doc, pno, glyph_bounds) for pno in range(len(doc))]
     _filter_repeated(pages)
+    _mark_document_references(pages)
     return pages
+
+
+def _mark_document_references(pages):
+    """Carry bibliography context across pages until a new section starts."""
+    in_references = False
+    for page in pages:
+        for block in page["blocks"]:
+            text = block["text"].strip()
+            if REF_HEAD_RE.fullmatch(text):
+                in_references = True
+            elif in_references and block.get("bold") and (
+                    re.match(r"^(?:Appendix|Appendices|Acknowledg|Supplement|[A-Z](?:\.|\s)|\d+\s+[A-Z])", text)
+                    or re.fullmatch(r"Limitations|Conclusion|Ethics Statement", text, re.I)):
+                in_references = False
+            if in_references:
+                block["skip"] = True
+                for key in ("inline_math", "inline_styles", "translation_text", "display_math"):
+                    block.pop(key, None)
 
 
 def _merge_lines(lines):
@@ -496,6 +505,47 @@ def _dedicated_math_span(span):
     return dedicated or (bool(span.get("flags", 0) & 2) and bool(re.fullmatch(r"[A-Za-z]", text)))
 
 
+def _join_split_math_rows(raw):
+    """Recover formula glyphs emitted in a different PDF block on the same row."""
+    output = []
+    for block in raw.get("blocks", []):
+        previous = output[-1] if output else None
+        if (previous and previous.get("lines") and block.get("lines")
+                and previous["bbox"][1] <= block["bbox"][1] < previous["bbox"][3]):
+            left = _group_visual_lines(previous["lines"])[-1]
+            right = _group_visual_lines(block["lines"])[0]
+            if _math_row_continues(left, right):
+                previous["lines"].extend(block["lines"])
+                previous["bbox"] = tuple(_rect_union([previous["bbox"], block["bbox"]]))
+                continue
+        output.append(block)
+    raw["blocks"] = output
+
+
+def _math_row_continues(left, right):
+    if not all(_is_horizontal(line) for line in left + right):
+        return False
+    a = _rect_union([line["bbox"] for line in left])
+    b = _rect_union([line["bbox"] for line in right])
+    if b[0] <= a[0] or b[2] <= a[2]:
+        return False
+    left_spans = [span for line in left for span in line["spans"]]
+    right_spans = [span for line in right for span in line["spans"]]
+    baseline, size = _raw_line_baseline({"spans": left_spans, "bbox": a})
+    next_baseline, next_size = _raw_line_baseline({"spans": right_spans, "bbox": b})
+    first = next((span for span in right_spans if span.get("text", "").strip()), None)
+    # Require a displaced script starting the new block. Same-baseline math
+    # alone can belong to a neighbouring table cell or diagram label.
+    return (abs(baseline - next_baseline) <= size * .2
+            and abs(size - next_size) <= size * .15
+            and -size * 1.2 <= b[0] - a[2] <= size * .6
+            and first is not None and _dedicated_math_span(first)
+            and float(first.get("size") or 10) < size * .85
+            and size * .12 <= abs(_span_baseline(first) - baseline) <= size * .65
+            and any(span["bbox"][2] >= a[2] - size * 1.2 and _dedicated_math_span(span)
+                    for span in left_spans))
+
+
 def _span_is_math_base(span):
     text = span.get("text", "").strip()
     if len(re.findall(r"[A-Za-z]{3,}", text)) >= 2:
@@ -537,23 +587,24 @@ def _inject_inline_styles(text, spans, style_offset=0):
         if (not phrase or not (bold or italic) or _dedicated_math_span(span)
                 or not any(ch.isalnum() for ch in phrase)):
             continue
-        start = source.find(phrase, cursor)
+        pattern = re.escape(phrase).replace(r"\ ", r"\s+")
+        if phrase[0].isalnum():
+            pattern = r"(?<!\w)" + pattern
+        if phrase[-1].isalnum():
+            pattern += r"(?!\w)"
+        found = re.search(pattern, source[cursor:])
+        start = cursor + found.start() if found else -1
         if start < 0:
             # Normalization can remove a space before punctuation.  Use a
             # whitespace-tolerant match, but never guess across formula tokens.
-            pattern = re.escape(phrase).replace(r"\ ", r"\s+")
-            found = re.search(pattern, source[cursor:])
-            if not found:
-                continue
-            start = cursor + found.start()
-            end = cursor + found.end()
+            continue
         else:
-            end = start + len(phrase)
+            end = cursor + found.end()
         if "__MATH_" in source[start:end]:
             cursor = end
             continue
         if (matches and matches[-1]["bold"] == bold and matches[-1]["italic"] == italic
-                and not source[matches[-1]["end"]:start].strip()):
+                and not re.sub(r"__MATH_\d{4,}__", "", source[matches[-1]["end"]:start]).strip()):
             # TeX frequently splits one visual title or author name into many
             # adjacent spans (kerning, colour or font subsetting).  They are one
             # semantic style run and should consume only one marker pair.
@@ -759,6 +810,32 @@ def _merge_formula_continuations(blocks):
     return result
 
 
+def _join_display_definitions(blocks):
+    """Keep an aligned 'where f(...) = g(...)' row with its display equation."""
+    output = []
+    for block in blocks:
+        previous = output[-1] if output else None
+        if (previous and previous.get("math")
+                and not previous.get("skip") and not block.get("skip")
+                and block.get("inline_math") and "=" in previous["text"]
+                and not re.search(r"\(\d+[a-z]?\)\s*$", previous["text"], re.I)):
+            a, b = fitz.Rect(previous["bbox"]), fitz.Rect(block["bbox"])
+            size = previous["font_size"]
+            text = block["text"]
+            match = re.fullmatch(
+                r"where\s+[\w^{}]+(?:\([^)]*\))?\s*=\s*\w+\s*(\(.*\))[.,]?", text, re.I)
+            if (match and not PROSE_CLAUSE_RE.search(match[1])
+                    and match[1].count("(") == match[1].count(")")
+                    and 0 <= b.y0 - a.y1 <= size * .65
+                    and abs((a.x0 + a.x1) - (b.x0 + b.x1)) <= size * 6
+                    and min(a.x1, b.x1) - max(a.x0, b.x0) >= min(a.width, b.width) * .75):
+                output[-1] = dict(previous, text=previous["text"] + " " + text,
+                                  bbox=[round(v, 2) for v in a | b], _whole_math=True)
+                continue
+        output.append(block)
+    return output
+
+
 def _merge_display_math_fragments(blocks, page_width):
     """Join the PDF objects that visually form one display equation.
 
@@ -776,6 +853,7 @@ def _merge_display_math_fragments(blocks, page_width):
     """
     if len(blocks) < 2:
         return blocks
+    blocks = _join_display_definitions(blocks)
 
     def formula_candidate(block):
         if block.get("skip"):
@@ -783,6 +861,8 @@ def _merge_display_math_fragments(blocks, page_width):
         if block.get("math"):
             return True
         text = (block.get("text") or "").strip()
+        if PROSE_CLAUSE_RE.search(text):
+            return False
         size = float(block.get("font_size") or 10)
         rect = fitz.Rect(block["bbox"])
         words = re.findall(r"[A-Za-z]{2,}", text)
@@ -811,6 +891,8 @@ def _merge_display_math_fragments(blocks, page_width):
         if formula_candidate(block):
             return True
         text = (block.get("text") or "").strip()
+        if PROSE_CLAUSE_RE.search(text):
+            return False
         size = float(block.get("font_size") or 10)
         rect = fitz.Rect(block["bbox"])
         words = re.findall(r"[A-Za-z]{2,}", text)
@@ -819,7 +901,8 @@ def _merge_display_math_fragments(blocks, page_width):
         }]
         math_alphabet = any("\U0001d400" <= ch <= "\U0001d7ff" for ch in text)
         formula_mark = (math_alphabet or any(ch in MATH_CHARS for ch in text)
-                        or bool(re.search(r"[=<>|_{}]|\d", text)))
+                        or bool(re.search(r"[=<>|_{}]|\d", text))
+                        or bool(re.fullmatch(r"[A-Z]{2,5}", text)))
         return (bool(text) and len(text) <= 72 and len(natural_words) <= 1
                 and rect.height <= size * 4.2 and formula_mark
                 and not re.search(r"[.!?]\s*$", text))
@@ -828,7 +911,8 @@ def _merge_display_math_fragments(blocks, page_width):
         if block.get("skip") or block.get("math") or formula_candidate(block):
             return False
         text = (block.get("text") or "").strip()
-        return len(text) >= 24 and len(re.findall(r"[A-Za-z]{2,}", text)) >= 4
+        return (bool(re.match(r"^(?:where|with)\b", text, re.I))
+                or (len(text) >= 24 and len(re.findall(r"[A-Za-z]{2,}", text)) >= 4))
 
     # First recover complete numbered equations.  Their right-aligned number is
     # a much stronger anchor than PDF object order or font names.  Neighbouring
@@ -885,7 +969,7 @@ def _merge_display_math_fragments(blocks, page_width):
             if i in claimed or not numbered_equation_fragment(block):
                 continue
             r = fitz.Rect(block["bbox"])
-            if r.y1 < top or r.y0 > bottom:
+            if (r.y0 + r.y1) / 2 < top or (r.y0 + r.y1) / 2 > bottom:
                 continue
             if r.x1 < col_x0 or r.x0 > col_x1:
                 continue
@@ -1200,7 +1284,8 @@ def _repair_radical_boxes(doc, page, raw, cache):
             changed = False
             for span in line.get("spans", []):
                 extensible = "cmex" in span.get("font", "").lower()
-                targets = {c["c"] for c in span.get("chars", []) if c["c"].strip() and (extensible or c["c"] == "√")}
+                targets = {c["c"] for c in span.get("chars", []) if c["c"].strip()
+                           and (extensible or c["c"] == "√" or c["bbox"][2] <= c["bbox"][0])}
                 if not targets or not _is_horizontal(line):
                     continue
                 if fonts is None:
@@ -1238,6 +1323,19 @@ def _repair_radical_boxes(doc, page, raw, cache):
                                                        x + bounds[2] * size, y + bounds[3] * size) + (-.15, -.15, .15, .15))
                 span["bbox"] = tuple(_rect_union([c["bbox"] for c in span["chars"]]))
                 changed = True
+            # Some TeX fonts map the combining negation stroke without a
+            # Unicode glyph in their cmap. Its zero advance is not zero ink.
+            # Include its preceding base glyph at the original coordinates.
+            previous = None
+            for span in line.get("spans", []):
+                for char in span.get("chars", []):
+                    rect = fitz.Rect(char["bbox"])
+                    if char["c"] == "\u0338" and rect.width <= 0 and previous is not None:
+                        char["bbox"] = tuple(previous | rect)
+                        span["bbox"] = tuple(fitz.Rect(span["bbox"]) | fitz.Rect(char["bbox"]))
+                        changed = True
+                    if char["c"].strip() and rect.width > 0:
+                        previous = rect
             if changed:
                 line["bbox"] = tuple(_rect_union([s["bbox"] for s in line["spans"]]))
 
@@ -1320,6 +1418,8 @@ def _math_only_source(block):
     if any(word.lower() not in operators and word[:1].islower() for word in raw_words):
         return False
     source_text = " ".join(s["text"] for s in spans)
+    if PROSE_CLAUSE_RE.search(source_text):
+        return False
     formula_syntax = bool(EQUATION_RE.search(source_text)
                           or re.search(r"\(\d+\)\s*$", source_text))
     return (len(words) <= 4
@@ -1359,12 +1459,21 @@ def _assemble_display_sources(raw):
 def _extract_page(doc, pno, glyph_bounds=None):
     page = doc[pno]
     d = page.get_text("rawdict")
+    # Broken ToUnicode maps can expose lone UTF-16 surrogates in rawdict.
+    # Match PyMuPDF's plain-text replacement while retaining the glyph crop.
+    for block in d.get("blocks", []):
+        for line in block.get("lines", []):
+            for span in line["spans"]:
+                for char in span.get("chars", []):
+                    if any(0xD800 <= ord(c) <= 0xDFFF for c in char["c"]):
+                        char["c"] = char["c"].encode("utf-16", "surrogatepass").decode("utf-16", "replace")
     _repair_radical_boxes(doc, page, d, glyph_bounds if glyph_bounds is not None else {})
     for b in d.get("blocks", []):
         for ln in b.get("lines", []):
             for span in ln["spans"]:
                 span["text"] = "".join(c["c"] for c in span.get("chars", []))
     _remove_margin_line_numbers(d)
+    _join_split_math_rows(d)
     _assemble_display_sources(d)
     lines = []
     math_offset = 0
@@ -1474,6 +1583,14 @@ def _extract_page(doc, pno, glyph_bounds=None):
         b.pop("_whole_math", None)
         b.pop("_table_region", None)
         b.pop("_algorithm_region", None)
+        numbers = re.findall(r"(?<!\w)[−-]?\d+\.\d+(?!\w)", b["text"])
+        words = re.findall(r"[A-Za-z]{2,}", b["text"])
+        if (len(numbers) >= 6 and len(numbers) >= len(words) * 2
+                and not re.search(r"\b(?:the|is|are|we|of|for|and|with|where|in|to|this|that|from|by|as)\b", b["text"], re.I)):
+            b["skip"] = True
+        if (re.search(r"mono|nimbusmon|typewriter|inconsolata|courier|(?:cm|sf)tt", b.get("font", ""), re.I)
+                and re.search(r'^[\d\s]*[{}\[\]]|^[\d\s]*["\'][\w.-]+["\']\s*:|^\s*\w+(?:\[[^]]+\])?\s*=|\b(?:def|class|import|return|let)\s+|=>|:=|\b\w+\.\w+\b.*[+*]|\b\w+\(\?\w|^(?:[a-z][\w-]*,\s*){5,}', b["text"])):
+            b["skip"] = True
         rect = fitz.Rect(b["bbox"])
         if (b.get("math") and not b.get("skip") and not page.rotation
                 and not any(abs(rect & fitz.Rect(r)) > abs(rect) * .25 for r in protected)):
@@ -1570,6 +1687,8 @@ def _table_caption_boxes(lines, page_width):
                 continue
             if TABLE_START_RE.match(other["text"]):
                 break
+            if abs(rect.x0 - start.x0) > max(12, base_size * 1.25):
+                break  # The caption ended and a table cell or another block began.
             gap = rect.y0 - last_bottom
             # Caption lines are tightly led.  The slightly larger gap before a
             # table header/rule terminates the caption without a language rule.
@@ -1595,11 +1714,7 @@ def _table_caption_near(table, caption):
 
 
 def _caption_regions(page, tables=None, algorithms=None):
-    """以 Table/Figure/Algorithm 标题为锚点，按栏向下扫描，返回该区块的包围盒。
-
-    表格/算法框：向下收集同栏的密集行（单元格/伪代码），到加粗标题或大间距停止。
-    图注：只保留标题段本身（图本身由矢量矩形保护区覆盖）。
-    """
+    """用标题定位无边框的表格和算法。表注本身单独翻译。"""
     lines = _page_lines(page)
     if not lines:
         return []
@@ -1613,32 +1728,29 @@ def _caption_regions(page, tables=None, algorithms=None):
     algorithms = _ruled_algorithm_regions(page) if algorithms is None else algorithms
     table_captions = dict(_table_caption_boxes(lines, page.rect.width))
     for i, ln in enumerate(lines):
-        # 只处理表格/算法标题的区域；图注不在这里生成（避免向下扫过正文吞并段落）。
-        # 无标点的 "Table N Title" 只有在附近已经检测到带横线的数值表时才成立。
         caption = fitz.Rect(table_captions.get(i, ln["bbox"]))
-        if ALGO_START_RE.match(ln["text"]) and any(abs(caption & r) >= abs(caption) * .8 for r in algorithms):
+        is_algorithm = bool(ALGO_START_RE.match(ln["text"]))
+        if is_algorithm and any(abs(caption & r) >= abs(caption) * .8 for r in algorithms):
             continue  # Exact ruled boundary already covers the complete algorithm.
-        table = next((r for r in tables if TABLE_START_RE.match(ln["text"])
-                      and _table_caption_near(r, caption)), None)
-        if not (TABLE_CAPTION_RE.match(ln["text"]) or ALGO_START_RE.match(ln["text"]) or table is not None):
+        if not is_algorithm and not TABLE_CAPTION_RE.match(ln["text"]):
             continue
-        if table is not None:
-            # The complete caption was reconstructed column-wise above.  Keep
-            # it separate from the ruled data region so both remain protected.
-            regions.append(list(caption))
+        if not is_algorithm and any(_table_caption_near(r, caption) for r in tables):
             continue
         leftcol = ln["bbox"][0] < mid
-        prev_y1 = ln["bbox"][3]
-        ys = [ln["bbox"][1], ln["bbox"][3]]
-        xs2 = [ln["bbox"][0], ln["bbox"][2]]
+        spans_columns = not is_algorithm and caption.x0 < mid < caption.x1
+        prev_y1 = caption.y1
+        ys = [caption.y0, caption.y1] if is_algorithm else []
+        xs2 = [caption.x0, caption.x1] if is_algorithm else []
         seen_cell = False
-        row_ys = {round(ln["bbox"][1], 1)}
-        col_w = max(1.0, max(xs2) - min(xs2))
+        row_ys = set()
+        col_w = caption.width
         for j in range(i + 1, len(lines)):
             nb = lines[j]
             bb = nb["bbox"]
-            if (bb[0] < mid) != leftcol:
+            if not spans_columns and (bb[0] < mid) != leftcol:
                 continue  # 跳过异栏行
+            if not is_algorithm and bb[3] <= caption.y1 + .1:
+                continue
             if nb["bold"] and nb["size"] > body + 1.0:
                 break  # 新加粗标题
             gap = bb[1] - prev_y1
@@ -1656,7 +1768,7 @@ def _caption_regions(page, tables=None, algorithms=None):
             ys += [bb[1], bb[3]]
             xs2 += [bb[0], bb[2]]
             prev_y1 = max(prev_y1, bb[3])
-        if max(ys) - min(ys) > 4:
+        if ys and (is_algorithm or seen_cell) and max(ys) - min(ys) > 4:
             regions.append([min(xs2), min(ys), max(xs2), max(ys)])
     return regions
 
@@ -1816,7 +1928,8 @@ def _ruled_algorithm_regions(page):
         if not separators:
             continue
         separator = min(separators, key=lambda r: r.y0)
-        bottoms = [r for r in aligned if separator.y1 + 12 <= r.y0 <= top.y0 + 260]
+        next_caption = min((ln["bbox"][1] for ln in captions if ln["bbox"][1] > c.y1), default=page.rect.height)
+        bottoms = [r for r in aligned if separator.y1 + 12 <= r.y0 <= next_caption]
         if not bottoms:
             continue
         bottom = min(bottoms, key=lambda r: r.y0)
@@ -1827,6 +1940,30 @@ def _ruled_algorithm_regions(page):
             continue
         regions.append(fitz.Rect(top.x0 - .4, top.y0 - .4, top.x1 + .4, bottom.y1 + .4) & page.rect)
     return regions
+
+
+def _prose_box_backgrounds(page, drawings):
+    """Find paired fills used as the background and frame of a text box."""
+    candidates = [(i, dr) for i, dr in enumerate(drawings)
+                  if dr["type"] == "f" and dr.get("fill")
+                  and dr["rect"].width >= page.rect.width * .35 and dr["rect"].height >= 40]
+    if not candidates:
+        return set()
+    lines = [ln for ln in _page_lines(page) if _is_horizontal(ln)
+             and len(re.findall(r"[A-Za-z]{2,}", ln["text"])) >= 7]
+    backgrounds = set()
+    for i, drawing in candidates:
+        if min(drawing["fill"]) < .88:
+            continue
+        rect = drawing["rect"]
+        frames = [j for j, dr in candidates if j != i and dr["fill"] != drawing["fill"]
+                  and abs(dr["rect"].x0 - rect.x0) <= 3 and abs(dr["rect"].x1 - rect.x1) <= 3
+                  and abs(dr["rect"].y1 - rect.y1) <= 3 and 0 <= rect.y0 - dr["rect"].y0 <= 26]
+        if frames and any(rect.contains(fitz.Rect(ln["bbox"]))
+                          and ln["bbox"][2] - ln["bbox"][0] >= rect.width * .55 for ln in lines):
+            backgrounds.add(i)
+            backgrounds.update(frames)
+    return backgrounds
 
 
 def _protected_rects(page, tables=None, algorithms=None):
@@ -1861,7 +1998,10 @@ def _protected_rects(page, tables=None, algorithms=None):
     try:
         drawing_groups = []
         drawings, clips = _clipped_drawings(page)
-        for dr in drawings:
+        prose_backgrounds = _prose_box_backgrounds(page, drawings)
+        for i, dr in enumerate(drawings):
+            if i in prose_backgrounds:
+                continue
             fill = dr.get("fill")
             if (dr.get("type") == "f" and fill and min(fill) >= 0.98
                     and dr.get("color") is None):
@@ -1891,7 +2031,17 @@ def _protected_rects(page, tables=None, algorithms=None):
                 graphics.append(r)
             elif r.width > 40 and r.height > 26:
                 graphics.append(r)
-        rects.extend(graphics)
+        chart_lines = _page_lines(page)
+        for r in graphics:
+            labels = [fitz.Rect(ln["bbox"]) for ln in chart_lines
+                      if r.y0 <= ln["bbox"][1] and ln["bbox"][3] <= r.y1
+                      and 0 <= r.x0 - ln["bbox"][2] <= 14
+                      and ln["bbox"][2] - ln["bbox"][0] < page.rect.width * .4
+                      and len(ln["text"]) < 80 and ln["size"] <= 12]
+            if len(labels) >= 3:
+                for label in labels:
+                    r |= label
+            rects.append(r)
         rects.extend(_figure_clip_regions(page, clips, graphics))
     except Exception:
         pass

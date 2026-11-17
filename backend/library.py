@@ -186,8 +186,12 @@ def reading_state(value):
               "scale": number("scale", 1, .25, 4),
               "duoScale": number("duoScale", 1, .25, 4),
               "duoOriginalScale": number("duoOriginalScale", 1, .25, 4)}
+    original_mode = value.get("originalMode", "single" if mode == "single" else "continuous")
+    if original_mode in ("continuous", "single"):
+        result["originalMode"] = original_mode
     for key in ("fitWidth", "duoFitOriginal", "duoFitTranslation", "duoShowOriginal"):
         result[key] = value.get(key, True) is not False
+    result["duoSync"] = value.get("duoSync") is True
     for key in ("continuous", "single", "original", "translation"):
         anchor = value.get(key)
         if isinstance(anchor, dict):
@@ -227,19 +231,69 @@ class PaperLibrary:
         return value
 
     def _write(self, record):
-        path = self._path(record["hash"])
-        self.directory.mkdir(parents=True, exist_ok=True)
+        self._write_json(self._path(record["hash"]), record)
+
+    @staticmethod
+    def _write_json(path, value):
+        path.parent.mkdir(parents=True, exist_ok=True)
         temp = None
         try:
-            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.directory, suffix=".tmp", delete=False) as stream:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, suffix=".tmp", delete=False) as stream:
                 temp = stream.name
-                json.dump(record, stream, ensure_ascii=False, allow_nan=False)
+                json.dump(value, stream, ensure_ascii=False, allow_nan=False)
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temp, path)
         finally:
             if temp and os.path.exists(temp):
                 os.unlink(temp)
+
+    def _presentation_path(self, record):
+        work_id = record.get("work_id")
+        key = "work-" + work_id if valid_hash(work_id) else "file-" + record["hash"]
+        return self.directory / "presentation" / (key + ".json")
+
+    def _read_presentation(self, path):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {"display_title": "", "archived": False, "presentation_revision": 0}
+        if (not isinstance(value, dict) or not isinstance(value.get("display_title"), str)
+                or not isinstance(value.get("archived"), bool)
+                or type(value.get("presentation_revision")) is not int
+                or value["presentation_revision"] < 1):
+            raise ValueError("论文名称或归档记录损坏，请检查数据目录")
+        return value
+
+    def present(self, record, restore=False):
+        with self.lock:
+            path = self._presentation_path(record)
+            value = self._read_presentation(path)
+            if restore and value["archived"]:
+                value.update(archived=False, presentation_revision=value["presentation_revision"] + 1)
+                self._write_json(path, value)
+            return {**record, **value}
+
+    def edit_presentation(self, digest, display_title=None, archived=None):
+        if display_title is not None:
+            display_title = " ".join(display_title.split())
+            if len(display_title) > 240:
+                raise ValueError("显示标题不能超过 240 个字符")
+        with self.lock:
+            record = self.get(digest)
+            if record is None:
+                raise KeyError(digest)
+            path = self._presentation_path(self._with_identity(record))
+            value = self._read_presentation(path)
+            updates = {}
+            if display_title is not None:
+                updates["display_title"] = display_title
+            if archived is not None:
+                updates["archived"] = archived
+            if any(value[key] != setting for key, setting in updates.items()):
+                value.update(updates, presentation_revision=value["presentation_revision"] + 1)
+                self._write_json(path, value)
+            return {"group_id": path.stem, **value}
 
     def _with_identity(self, record):
         """Refresh titles and edition identity once, without changing reading history."""
@@ -297,6 +351,10 @@ class PaperLibrary:
                 try:
                     record = self._with_identity(self.get(path.stem))
                     record["available"] = (self.uploads / (path.stem + ".pdf")).exists()
+                    try:
+                        record = self.present(record)
+                    except (ValueError, OSError):
+                        damaged += 1
                     items.append(record)
                 except (ValueError, OSError):
                     damaged += 1

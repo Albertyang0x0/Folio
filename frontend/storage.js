@@ -2,9 +2,10 @@
 "use strict";
 
 const StorageManager = (() => {
+  const isMac = document.documentElement.dataset.platform === "macos";
   let notify = () => {}, current = null, returnFocus = null;
   const el = (id) => document.getElementById(id);
-  const labels = { papers: "原始论文", extracted: "版面数据", translations: "翻译缓存", records: "阅读记录", browser: "笔记与应用数据" };
+  const labels = { papers: "原始论文", extracted: "版面数据", translations: "翻译与速览缓存", records: "阅读记录", other: "其他应用文件" };
 
   function formatBytes(value) {
     const bytes = Math.max(0, Number(value) || 0);
@@ -23,7 +24,7 @@ const StorageManager = (() => {
         const key = localStorage.key(i);
         if (key && key.startsWith("paper-reader-")) bytes += encoder.encode(key + (localStorage.getItem(key) || "")).byteLength;
       }
-    } catch (_) { return 0; }
+    } catch (_) { return null; }
     return bytes;
   }
 
@@ -40,49 +41,66 @@ const StorageManager = (() => {
     el("storageTotal").textContent = "正在计算…";
     el("storageFree").textContent = "磁盘空间读取中";
     el("storagePath").textContent = "—";
+    el("storagePath").removeAttribute("title");
+    updateLocationActions();
     el("storageMeter").replaceChildren();
     document.querySelectorAll(".storage-row").forEach((row) => {
       row.querySelector(".storage-size").textContent = "—";
-      if (row.dataset.storageCategory !== "browser") row.querySelector(".storage-count").textContent = "";
+      row.querySelector(".storage-count").textContent = "";
     });
     el("btnClearStorageCache").disabled = true;
     setError("");
   }
 
+  function updateLocationActions() {
+    const reveal = el("btnRevealStoragePath");
+    const canReveal = isMac && typeof window.pywebview?.api?.reveal_data_dir === "function";
+    reveal.classList.toggle("hidden", !canReveal);
+    reveal.disabled = !current?.data_dir;
+    el("btnCopyStoragePath").disabled = !current?.data_dir;
+  }
+
   function render(data) {
-    const clientBytes = data.desktop_mode ? 0 : browserBytes();
-    const application = data.categories?.other || { bytes: 0, files: 0 };
-    const categories = { ...data.categories, browser: {
-      bytes: Math.max(0, Number(application.bytes) || 0) + clientBytes,
-      files: Math.max(0, Number(application.files) || 0),
-    } };
-    const total = Math.max(0, Number(data.total_bytes) || 0) + clientBytes;
-    current = { ...data, categories, total };
+    const categories = data.categories;
+    const total = Math.max(0, Number(data.total_bytes) || 0);
+    const desktopProfile = data.desktop_mode && typeof window.pywebview?.api === "object";
+    const profileInDirectory = desktopProfile && !isMac;
+    const profileBytes = profileInDirectory ? null : browserBytes();
+    current = { ...data, categories };
     el("storageModal").removeAttribute("aria-busy");
     el("storageTotal").textContent = formatBytes(total);
     el("storageFree").textContent = data.free_bytes == null ? "磁盘余量不可用" : "磁盘可用 " + formatBytes(data.free_bytes);
     el("storagePath").textContent = data.data_dir || "—";
     el("storagePath").title = data.data_dir || "";
+    updateLocationActions();
     const meter = el("storageMeter");
     meter.replaceChildren();
-    const visible = ["papers", "extracted", "translations", "records", "browser"];
+    const visible = ["papers", "extracted", "translations", "records", "other"];
     for (const name of visible) {
       const category = categories[name] || { bytes: 0, files: 0 };
       const row = document.querySelector('[data-storage-category="' + name + '"]');
       row.querySelector(".storage-size").textContent = formatBytes(category.bytes);
-      row.querySelector(".storage-count").textContent = name === "browser"
-        ? (data.desktop_mode ? category.files + " 个本地文件" : "浏览器本地")
-        : category.files + " 个文件";
+      row.querySelector(".storage-count").textContent = category.files + " 个文件";
       if (category.bytes > 0) {
         const segment = document.createElement("span");
-        segment.className = name;
+        segment.className = name === "other" ? "browser" : name;
         segment.style.flexGrow = String(category.bytes);
         segment.title = labels[name] + " · " + formatBytes(category.bytes);
         meter.appendChild(segment);
       }
     }
-    meter.setAttribute("aria-label", "共使用 " + formatBytes(total) + "；" + visible.map((name) =>
-      labels[name] + " " + formatBytes((categories[name] || {}).bytes)).join("；"));
+    meter.setAttribute("aria-label", "数据目录共使用 " + formatBytes(total) + "，" + visible.map((name) =>
+      labels[name] + " " + formatBytes((categories[name] || {}).bytes)).join("，"));
+
+    const profile = document.querySelector('[data-storage-category="browser"]');
+    profile.querySelector(".storage-size").textContent = profileBytes == null ? "—" : "约 " + formatBytes(profileBytes);
+    profile.querySelector(".storage-count").textContent = profileInDirectory ? "已计入其他应用文件" : "单独存储";
+    const profileLocation = profileInDirectory ? "由便携版的 WebView2 保存" :
+      desktopProfile && isMac ? "由 macOS 的 WebKit 保存" : "保存在当前浏览器中";
+    el("storageProfileLocation").textContent = profileLocation;
+    el("storageBackupHint").textContent = profileInDirectory
+      ? "备份整个论文数据目录可以保留 PDF、阅读位置、笔记、书签与设置。"
+      : "备份数据目录会保留 PDF、版面、译文缓存和阅读位置。笔记、书签与设置" + profileLocation + "，需另外备份站点数据。";
     el("btnClearStorageCache").disabled = !(categories.translations?.bytes > 0);
     setError("");
   }
@@ -109,12 +127,14 @@ const StorageManager = (() => {
     if (!el("storageModal").classList.contains("hidden")) return;
     returnFocus = focusTarget || document.activeElement;
     el("storageModal").classList.remove("hidden");
+    el("storageModal").inert = false;
     el("btnCloseStorage").focus({ preventScroll: true });
     load();
   }
 
   function close() {
     if (el("storageModal").classList.contains("hidden")) return;
+    el("storageModal").inert = true;
     el("storageModal").classList.add("hidden");
     if (returnFocus?.isConnected && returnFocus.getClientRects().length) returnFocus.focus({ preventScroll: true });
     returnFocus = null;
@@ -122,7 +142,7 @@ const StorageManager = (() => {
 
   async function clearTranslations() {
     const size = current?.categories?.translations?.bytes || 0;
-    if (!size || !confirm("清理 " + formatBytes(size) + " 翻译缓存？\n\nPDF、笔记、书签和阅读进度会保留。再次查看译文时需要重新调用翻译接口。")) return;
+    if (!size || !confirm("清理 " + formatBytes(size) + " 的翻译和速览缓存？\n\n再次查看译文或速览时需要重新生成。")) return;
     const button = el("btnClearStorageCache");
     button.disabled = true; button.textContent = "正在清理…"; setError("");
     try {
@@ -130,11 +150,11 @@ const StorageManager = (() => {
       const data = await response.json().catch(() => ({}));
       if (!response.ok || !data.ok) throw new Error(data.detail || "清理未完成");
       if (data.storage) render(data.storage); else await load();
-      notify(data.freed_bytes ? "已释放 " + formatBytes(data.freed_bytes) : "翻译缓存已清空");
+      notify(data.freed_bytes ? "已释放 " + formatBytes(data.freed_bytes) : "缓存已清空");
     } catch (error) {
       setError(error.message || "清理缓存失败，请重试");
       button.disabled = false;
-    } finally { button.textContent = "清理翻译缓存"; }
+    } finally { button.textContent = "清理翻译与速览"; }
   }
 
   function init(options = {}) {
@@ -144,6 +164,12 @@ const StorageManager = (() => {
     el("btnDoneStorage").addEventListener("click", close);
     el("btnReloadStorage").addEventListener("click", load);
     el("btnClearStorageCache").addEventListener("click", clearTranslations);
+    window.addEventListener("pywebviewready", updateLocationActions);
+    el("btnRevealStoragePath").addEventListener("click", async () => {
+      try {
+        if (!await window.pywebview?.api?.reveal_data_dir()) notify("无法打开论文数据目录");
+      } catch (_) { notify("无法打开论文数据目录，请复制路径后在 Finder 中打开"); }
+    });
     el("btnCopyStoragePath").addEventListener("click", async () => {
       const path = current?.data_dir;
       if (!path) return;

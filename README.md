@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img alt="Platform" src="https://img.shields.io/badge/platform-Windows-1d4e73?style=flat-square">
+  <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS-1d4e73?style=flat-square">
   <img alt="Python" src="https://img.shields.io/badge/Python-3.9%2B-3776ab?style=flat-square&logo=python&logoColor=white">
   <img alt="Local first" src="https://img.shields.io/badge/data-local--first-2b7a78?style=flat-square">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-5b6b82?style=flat-square">
@@ -105,9 +105,15 @@ PDF 文件始终保存在本机。只有需要翻译的文字段落会按照你�
 
 > 请勿直接在 ZIP 预览窗口中运行。未签名的开源构建可能触发 Windows SmartScreen，可核对 Release 中提供的 SHA-256 后继续运行。
 
+### macOS 桌面版
+
+在 Mac 上准备 Python 3.10+（建议 3.12）和 Xcode 命令行工具，在项目根目录运行 `./build_macos.sh`。构建会生成 `dist/Folio.app` 和当前 Python 架构对应的 ZIP（例如 `dist/Folio-macOS-arm64.zip`）。双击 `Folio.app` 即可运行，应用内已包含 Python。
+
+论文库、解析和翻译缓存及诊断日志默认位于 `~/Library/Application Support/Folio`。设置、笔记和书签使用 macOS WebKit 的本地存储。默认构建适合本机测试。[macOS 打包与应用内更新](docs/macos-release.md)介绍了签名、公证和更新源配置。
+
 ### 从源码运行
 
-环境要求：Windows、Python 3.9+。建议使用 Python 3.10 或更高版本。
+环境要求：Python 3.9+。建议使用 Python 3.10 或更高版本。Windows 上运行：
 
 ```powershell
 python -m venv .venv
@@ -116,6 +122,14 @@ python -m venv .venv
 ```
 
 打开 `http://127.0.0.1:8000`。也可以直接运行 `start.bat`，由脚本创建虚拟环境、安装依赖并启动应用。
+
+macOS 上可直接启动桌面窗口：
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r backend/requirements-desktop.txt
+.venv/bin/python backend/desktop.py
+```
 
 ## 构建 Windows 便携版
 
@@ -152,7 +166,7 @@ dist/Folio-Portable-x64.zip
 | PDF 渲染 | pdf.js |
 | 译文排版 | Canvas 2D + 自定义段落、公式与保护区布局 |
 | 翻译服务 | DeepSeek Chat Completions API |
-| Windows 桌面外壳 | pywebview + Edge WebView2 |
+| 桌面外壳 | pywebview + Edge WebView2（Windows）/ WKWebView（macOS） |
 | 便携版构建 | PyInstaller |
 
 ## 项目结构

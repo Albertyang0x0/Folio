@@ -27,7 +27,7 @@ const readerNotes = (() => {
   const documents = new Map(), surfaces = new Map();
   let api, pendingSelection = null, pendingJump = null, selectionFrame = 0, dragging = false, pointerStart = null;
   const el = (id) => document.getElementById(id);
-  const enabled = () => api && api.getDoc() && api.getMode() !== "duo";
+  const enabled = () => api && api.getDoc();
   const pageLabel = (note) => {
     const pages = note.anchors.map((a) => a.page + 1);
     return pages.length === 1 ? "第 " + pages[0] + " 页" : "第 " + pages[0] + "–" + pages[pages.length - 1] + " 页";
@@ -113,14 +113,16 @@ const readerNotes = (() => {
 
   function sync() {
     const available = enabled(), value = data();
-    el("noteControls").classList.toggle("hidden", !available);
+    el("btnNotes").classList.toggle("hidden", !available);
     const open = !!(available && value.panelOpen);
+    el("notesSidebar").inert = !open;
     el("notesSidebar").classList.toggle("hidden", !open);
     el("btnNotes").setAttribute("aria-expanded", String(open));
     el("noteCount").textContent = value ? value.notes.length : 0;
+    el("noteCount").classList.toggle("hidden", !value?.notes.length);
     el("btnToggleMarks").textContent = value && !value.marksVisible ? "显示标记" : "隐藏标记";
     el("btnToggleMarks").setAttribute("aria-pressed", String(!!(value && value.marksVisible)));
-    el("btnToggleMarks").disabled = !value || !value.notes.length;
+    el("btnToggleMarks").classList.toggle("hidden", !value?.notes.length);
     renderList();
     const note = activeNote();
     el("noteEditor").classList.toggle("hidden", !note);
@@ -134,13 +136,15 @@ const readerNotes = (() => {
     if (!available) clearSelection();
   }
 
-  function openNote(id, navigate = false) {
+  async function openNote(id, navigate = false) {
     if (!enabled()) return;
     const doc = api.getDoc(), value = data(doc), note = value.notes.find((n) => n.id === id);
     if (!note) return;
     value.activeId = id; value.panelOpen = true;
     sync();
     if (navigate) {
+      if (api.getMode() === "duo" && !doc.duoShowOriginal) await api.revealOriginal();
+      if (api.getDoc() !== doc) return;
       pendingJump = { docId: doc.id, noteId: id };
       api.goToPage(note.anchors[0].page + 1);
       requestAnimationFrame(finishJump);
@@ -154,7 +158,7 @@ const readerNotes = (() => {
     for (const surface of surfaces.values()) {
       if (surface.doc.id !== pendingJump.docId || surface.page !== note.anchors[0].page || !surface.host.getClientRects().length) continue;
       const rect = note.anchors[0].rects[0], host = surface.host.getBoundingClientRect();
-      const scroller = surface.host.closest(".view"), view = scroller.getBoundingClientRect();
+      const scroller = surface.host.closest(".duo-scroll, .view"), view = scroller.getBoundingClientRect();
       scroller.scrollTop += host.top + ((rect[1] + rect[3]) / 2) * host.height - view.top - view.height / 2;
       scroller.scrollLeft += host.left + ((rect[0] + rect[2]) / 2) * host.width - view.left - view.width / 2;
       pendingJump = null;
@@ -245,11 +249,11 @@ const readerNotes = (() => {
     const selection = window.getSelection();
     if (!selection || selection.isCollapsed || !selection.rangeCount) return null;
     const doc = api.getDoc(), anchors = [], fragments = [];
-    const view = el(api.getMode() === "single" ? "singleView" : "continuousView").getBoundingClientRect();
     let endRect = null;
     for (const surface of surfaces.values()) {
       if (surface.doc !== doc || !surface.host.getClientRects().length) continue;
       const host = surface.host.getBoundingClientRect(), rects = [], strings = [];
+      const view = surface.host.closest(".duo-scroll, .view").getBoundingClientRect();
       for (const span of surface.text.querySelectorAll("span")) {
         if (!span.firstChild || span.firstChild.nodeType !== Node.TEXT_NODE) continue;
         for (let i = 0; i < selection.rangeCount; i++) {
@@ -374,7 +378,7 @@ const readerNotes = (() => {
     el("btnCopySelection").addEventListener("click", async () => {
       const selected = pendingSelection; if (!selected) return;
       try { await navigator.clipboard.writeText(selected.quote); clearSelection(); api.toast("已复制选中文字", 1800); }
-      catch (error) { api.toast("无法访问剪贴板，请按 Ctrl+C 复制选中文字。", 4000); }
+      catch (error) { api.toast(`无法访问剪贴板，请按 ${shortcutModifier}+C 复制选中文字。`, 4000); }
     });
     document.addEventListener("copy", (event) => {
       const selected = captureSelection();

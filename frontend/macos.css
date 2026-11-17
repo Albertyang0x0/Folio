@@ -1,0 +1,398 @@
+/* macOS chrome. Keep the PDFs and library content on solid reading surfaces. */
+:root[data-platform="macos"] {
+  --ink: #172534;
+  --ink-2: #3b4d5f;
+  --ink-3: #536475;
+  --accent: #075eaa;
+  --accent-2: #064a89;
+  --accent-3: #5b7d9a;
+  --focus: #076bc2;
+  --ice: #167dca;
+  --accent-soft: rgb(23 116 198 / .12);
+  --app-bg: #e7ecf2;
+  --surface-muted: #edf2f7;
+  --glass: rgb(255 255 255 / .58);
+  --glass-strong: rgb(247 251 255 / .85);
+  --stroke: rgb(255 255 255 / .82);
+  --stroke-2: rgb(45 73 100 / .23);
+  --stroke-3: rgb(45 73 100 / .16);
+  --radius: 24px;
+  --motion: 160ms;
+  --ease-glass: cubic-bezier(.21, .82, .24, 1);
+  --mac-fold: 290ms;
+  --mac-panel: 225ms;
+  --mac-material: rgb(245 249 254 / .79);
+  --mac-panel-fill: #f1f5f9;
+  --mac-rail: rgb(242 247 252 / .94);
+  --mac-stage: #e2eaf3;
+  --mac-field: #edf2f7;
+  --mac-field-hover: #f7fafd;
+  --mac-selection: #f8fbff;
+  --mac-selection-end: #e6f1fd;
+  --mac-hover: rgb(41 113 172 / .08);
+  --mac-primary: #075eaa;
+  --mac-primary-hover: #064a89;
+  --mac-muted-shadow: 0 2px 8px rgb(31 55 86 / .08);
+  --mac-control-well: rgb(44 69 96 / .07);
+  --mac-storage-success: #28654f;
+  --mac-danger: #8a3f43;
+  --mac-sheen: linear-gradient(155deg, rgb(255 255 255 / .72), rgb(255 255 255 / .17) 48%, rgb(215 231 247 / .25));
+  --mac-rim: inset 0 1px 1px rgb(255 255 255 / .98), inset 0 -1px 1px rgb(56 85 117 / .12);
+  --mac-elevation: 0 10px 30px -15px rgb(31 55 86 / .38), 0 2px 5px -3px rgb(31 55 86 / .22);
+  --mac-float-shadow: 0 22px 60px -21px rgb(25 48 80 / .42), 0 7px 20px -12px rgb(25 48 80 / .35);
+  --mac-paper: #f8fafd;
+}
+
+[data-platform="macos"] body {
+  background:
+    linear-gradient(180deg, rgb(244 248 252 / .12), rgb(227 236 246 / .29)),
+    url("assets/glacier-wallpaper.png") center / cover no-repeat, var(--app-bg);
+}
+
+[data-platform="macos"] body::before { content: none; }
+
+[data-platform="macos"] :is(#topbar, #sidebar.collapsed .sidebar-control-cluster, #hud,
+  .library-brandbar, .selection-toolbar) {
+  background-color: var(--mac-material);
+  background-image: var(--mac-sheen);
+  border-color: var(--stroke);
+  box-shadow: var(--mac-rim), var(--mac-elevation);
+  -webkit-backdrop-filter: blur(22px) saturate(155%);
+  backdrop-filter: blur(22px) saturate(155%);
+}
+
+[data-platform="macos"] :is(#sidebar:not(.collapsed), .notes-sidebar, .modal-card, #searchPanel) {
+  background: var(--mac-rail);
+  border-color: var(--stroke-3);
+  box-shadow: none;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+
+[data-platform="macos"] :is(.upload-card, .resume-card, #dropZone, .library-search) {
+  background-color: var(--mac-paper);
+  border-color: var(--stroke-3);
+  box-shadow: var(--mac-muted-shadow);
+  background-image: none;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+
+[data-platform="macos"] :is(.btn, .icon, .zoom, .zoom .z, .vseg, .vseg .v, .vseg::before,
+  .shead, .shead .s, .pgbtn, .library-search, #pageInput, .searchbox) {
+  border-radius: 999px;
+}
+[data-platform="macos"] .btn {
+  transition: background-color var(--motion), color var(--motion), border-color var(--motion),
+    transform var(--motion) var(--ease-glass);
+}
+[data-platform="macos"] .btn:not(:active):hover { transform: none; }
+[data-platform="macos"] :is(.btn, .icon, .zoom .z, .pgbtn):active:not(:disabled) {
+  transform: scale(.95);
+  transition-duration: 90ms;
+}
+[data-platform="macos"] .btn.primary {
+  background-color: var(--mac-primary);
+  background-image: linear-gradient(175deg, rgb(255 255 255 / .22), transparent 65%);
+  box-shadow: inset 0 1px 1px rgb(255 255 255 / .5), 0 3px 8px -3px rgb(10 84 162 / .48);
+}
+[data-platform="macos"] .btn.primary:hover { background-color: var(--mac-primary-hover); }
+[data-platform="macos"] :is(.vseg, .shead, .zoom) {
+  background: var(--mac-control-well);
+  border-color: var(--stroke-3);
+  box-shadow: none;
+}
+[data-platform="macos"] .vseg .v { flex-basis: 0; white-space: nowrap; }
+[data-platform="macos"] .vseg::before {
+  background: linear-gradient(160deg, var(--mac-selection), var(--mac-selection-end));
+  box-shadow: var(--mac-rim), 0 3px 8px rgb(40 64 88 / .16);
+  transition-duration: 255ms;
+}
+[data-platform="macos"] .vseg .v.active { color: var(--accent-2); }
+[data-platform="macos"] :is(.tab, .tab .x, .reader-chrome-toggle, #sidebar.collapsed .reader-chrome-toggle,
+  #sidebar.collapsed .sidebar-caption, .library-actions .icon) { border-radius: 999px; }
+[data-platform="macos"] .tab { padding: 7px 12px; }
+[data-platform="macos"] .tab::before { display: none; }
+[data-platform="macos"] .tab.active { background: var(--mac-selection); border-color: var(--stroke-3); }
+[data-platform="macos"] .tab:not(.active):hover { background-color: var(--mac-hover); }
+[data-platform="macos"] .tab .x { font-size: 14px; }
+
+[data-platform="macos"] .library-shell { padding: 18px clamp(24px, 4vw, 60px) 36px; }
+[data-platform="macos"] .library-brandbar {
+  position: sticky;
+  top: 12px;
+  z-index: 3;
+  min-height: 58px;
+  padding: 8px 15px 8px 17px;
+  border-radius: 30px;
+  gap: 14px;
+}
+[data-platform="macos"] .library-brandbar .brand { font-size: 17px; }
+[data-platform="macos"] .library-brandbar .logo { width: 34px; height: 34px; }
+[data-platform="macos"] .library-actions { gap: 5px; }
+[data-platform="macos"] .library-actions .btn { padding-block: 8px; }
+[data-platform="macos"] .library-heading { padding: 32px 4px 18px; }
+[data-platform="macos"] .library-heading h1 { margin: 0; font-size: clamp(28px, 3vw, 35px); letter-spacing: -.025em; }
+[data-platform="macos"] :is(.library-eyebrow, .workspace-caption, .slogan, .library-local,
+  .footer-signature, .panel-eyebrow, .sidebar-caption [lang="en"]) { display: none; }
+[data-platform="macos"] .sidebar-caption { grid-template-columns: minmax(0, 1fr) auto; }
+[data-platform="macos"] :is(.library-brandbar, .library-heading, .library-overview, .upload-card) { animation: none; }
+[data-platform="macos"] .library-overview { gap: 14px; margin-bottom: 18px; }
+[data-platform="macos"] .resume-card { min-height: 184px; }
+[data-platform="macos"] .resume-content { padding: 20px 24px; }
+[data-platform="macos"] .resume-landscape {
+  background-image: linear-gradient(90deg, #f8fafd, rgb(248 250 253 / .93) 55%, rgb(248 250 253 / .46)), url("assets/glacier-wallpaper.png");
+}
+[data-platform="macos"] #dropZone { gap: 14px; }
+[data-platform="macos"] #dropZone.over { background: #e5f2ff; border-color: var(--focus); }
+[data-platform="macos"] .library-search {
+  background-color: var(--mac-field);
+  padding-block: 8px;
+  box-shadow: none;
+}
+[data-platform="macos"] .library-search:focus-within { background-color: var(--mac-field-hover); }
+[data-platform="macos"] .paper-row { min-height: 65px; padding-block: 13px; }
+[data-platform="macos"] .paper-row:hover { background: var(--mac-hover); box-shadow: none; }
+
+[data-platform="macos"] .reader-chrome,
+[data-platform="macos"] #main,
+[data-platform="macos"] .duo-body {
+  transition-duration: var(--mac-fold);
+}
+[data-platform="macos"] #topbar {
+  padding-inline: 14px;
+  transition: margin-top var(--mac-fold) var(--ease-glass), opacity 170ms ease-out,
+    transform var(--mac-fold) var(--ease-glass);
+}
+[data-platform="macos"] .reader-chrome-collapsed #topbar { border-width: 1px; }
+[data-platform="macos"] #sidebar {
+  --mac-sidebar-width: 220px;
+  width: var(--mac-sidebar-width);
+  min-height: 0;
+  will-change: auto;
+  transition: width var(--mac-fold) var(--ease-glass), margin-right var(--mac-fold) var(--ease-glass);
+}
+[data-platform="macos"] #sidebar.collapsed {
+  width: 0;
+  height: 0;
+  border: 0;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+[data-platform="macos"] .sidebar-content {
+  width: calc(var(--mac-sidebar-width) - 2px);
+  transition: opacity 150ms ease 65ms, transform var(--mac-fold) var(--ease-glass);
+}
+[data-platform="macos"] #sidebar.collapsed .sidebar-content { opacity: 0; transform: translateX(-8px); }
+[data-platform="macos"] .sidebar-control-cluster { border-radius: 999px; }
+[data-platform="macos"] #sidebar.collapsed .sidebar-control-cluster {
+  width: 138px;
+  border-radius: 999px;
+}
+[data-platform="macos"] #viewer {
+  background-color: var(--mac-stage);
+  border: none;
+}
+
+[data-platform="macos"] .duo-pane {
+  border-radius: 16px;
+  border-color: var(--stroke-3);
+  background: var(--mac-stage);
+  transition: flex-grow var(--mac-fold) var(--ease-glass), opacity 160ms ease-out;
+}
+[data-platform="macos"] .duo-body.original-collapsed #duoOriginalPane {
+  transform: none;
+  transition: flex-grow var(--mac-fold) var(--ease-glass), opacity 135ms ease-in,
+    visibility 0s linear var(--mac-fold);
+}
+[data-platform="macos"] #hud {
+  bottom: 16px;
+  border-radius: 999px;
+  padding: 4px 6px;
+  gap: 6px;
+}
+[data-platform="macos"] .pgbtn {
+  width: 33px;
+  height: 30px;
+  font-size: 21px;
+  transition: background-color var(--motion), transform var(--motion) var(--ease-glass);
+}
+[data-platform="macos"] :is(#pageInput, .page-total, .zval) { font-variant-numeric: tabular-nums; }
+[data-platform="macos"] .notes-sidebar { width: clamp(290px, 25vw, 336px); }
+
+[data-platform="macos"] .modal {
+  background-color: rgb(22 41 60 / .21);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+[data-platform="macos"] .modal-card {
+  background: var(--mac-panel-fill);
+  border-radius: 24px;
+  box-shadow: var(--mac-float-shadow);
+}
+[data-platform="macos"] .selection-toolbar { box-shadow: var(--mac-rim), var(--mac-float-shadow); }
+[data-platform="macos"] :is(.modal-card input, .modal-card select, #noteBody, #pageInput) {
+  background: var(--mac-field);
+  box-shadow: none;
+}
+[data-platform="macos"] :is(.modal-hint, .storage-location, .storage-summary, .storage-list) {
+  background: var(--mac-paper);
+  border-color: var(--stroke-3);
+  box-shadow: none;
+}
+[data-platform="macos"] .storage-summary::after { content: none; }
+[data-platform="macos"] .storage-safety::before { color: var(--mac-storage-success); }
+[data-platform="macos"] :is(#searchPanel, .selection-toolbar, #toast) { transform-origin: top center; }
+[data-platform="macos"] #toast {
+  border: 1px solid rgb(255 255 255 / .24);
+  background: #253c55;
+  border-radius: 999px;
+  box-shadow: var(--mac-float-shadow);
+}
+@supports (transition-behavior: allow-discrete) {
+  [data-platform="macos"] :is(.modal, #searchPanel, .selection-toolbar, .notes-sidebar, #toast) {
+    opacity: 1;
+    animation: none;
+    transition: opacity var(--mac-panel) var(--ease-glass), transform var(--mac-panel) var(--ease-glass),
+      display var(--mac-panel) allow-discrete;
+  }
+  [data-platform="macos"] .modal .modal-card {
+    transform: none;
+    animation: none;
+    transition: transform var(--mac-panel) var(--ease-glass);
+  }
+  [data-platform="macos"] :is(.modal, #searchPanel, .selection-toolbar, .notes-sidebar, #toast).hidden {
+    opacity: 0;
+    pointer-events: none;
+  }
+  [data-platform="macos"] .modal.hidden .modal-card { transform: translateY(11px) scale(.975); }
+  [data-platform="macos"] #searchPanel.hidden { transform: translateY(-6px) scale(.98); }
+  [data-platform="macos"] .selection-toolbar.hidden { transform: translateY(4px) scale(.97); }
+  [data-platform="macos"] .notes-sidebar.hidden { transform: translateX(9px); }
+  @starting-style {
+    [data-platform="macos"] :is(.modal, #searchPanel, .selection-toolbar, .notes-sidebar, #toast):not(.hidden) { opacity: 0; }
+    [data-platform="macos"] .modal:not(.hidden) .modal-card { transform: translateY(11px) scale(.975); }
+    [data-platform="macos"] #searchPanel:not(.hidden) { transform: translateY(-6px) scale(.98); }
+    [data-platform="macos"] .selection-toolbar:not(.hidden) { transform: translateY(4px) scale(.97); }
+    [data-platform="macos"] .notes-sidebar:not(.hidden) { transform: translateX(9px); }
+    [data-platform="macos"] #toast:not(.hidden) { transform: translateX(-50%) translateY(8px); }
+  }
+}
+
+@media (max-width: 1200px) {
+  [data-platform="macos"] .notes-sidebar { position: absolute; right: 0; inset-block: 0; z-index: 36; }
+}
+@media (max-width: 900px) {
+  [data-platform="macos"] #sidebar { --mac-sidebar-width: 190px; }
+}
+@media (max-width: 600px) {
+  [data-platform="macos"] #sidebar { --mac-sidebar-width: 156px; }
+  [data-platform="macos"] .library-shell { padding-inline: 12px; }
+  [data-platform="macos"] .library-brandbar { padding-inline: 10px; }
+  [data-platform="macos"] .library-brandbar .brand-name { font-size: 15px; }
+}
+@media (prefers-color-scheme: dark) {
+  :root[data-platform="macos"] {
+    color-scheme: dark;
+    --ink: #eef5fc;
+    --ink-2: #c0cfde;
+    --ink-3: #a7bbcf;
+    --focus: #8cc7ff;
+    --accent: #8cc7ff;
+    --accent-2: #c1e1ff;
+    --accent-3: #6b98be;
+    --ice: #64baff;
+    --accent-soft: rgb(90 167 242 / .17);
+    --app-bg: #121a25;
+    --surface: #1b2735;
+    --surface-muted: #263647;
+    --glass: rgb(181 217 249 / .10);
+    --glass-strong: #243140;
+    --stroke: rgb(185 213 241 / .20);
+    --stroke-2: rgb(172 206 238 / .34);
+    --stroke-3: rgb(172 206 238 / .20);
+    --shadow: 0 8px 24px -16px #02060d;
+    --shadow-soft: 0 2px 7px rgb(0 0 0 / .26);
+    --shadow-page: 0 6px 20px -5px rgb(0 0 0 / .45);
+    --mac-material: rgb(32 45 61 / .86);
+    --mac-panel-fill: #202d3b;
+    --mac-rail: #202b38;
+    --mac-stage: #18222e;
+    --mac-field: #182430;
+    --mac-field-hover: #263647;
+    --mac-selection: #344759;
+    --mac-selection-end: #2b3b4d;
+    --mac-hover: rgb(164 210 252 / .12);
+    --mac-primary: #1d619f;
+    --mac-primary-hover: #236ead;
+    --mac-control-well: rgb(8 15 24 / .28);
+    --mac-paper: #1c2734;
+    --mac-rim: inset 0 1px 1px rgb(185 215 242 / .12);
+    --mac-sheen: linear-gradient(160deg, rgb(149 183 216 / .11), transparent 60%);
+    --mac-elevation: 0 6px 18px -9px rgb(0 0 0 / .55);
+    --mac-float-shadow: 0 24px 64px -20px rgb(0 0 0 / .76);
+    --mac-muted-shadow: 0 2px 8px rgb(0 0 0 / .2);
+    --mac-storage-success: #9bdaba;
+    --mac-danger: #ffb5ba;
+  }
+
+  [data-platform="macos"] body { background: var(--app-bg); }
+  [data-platform="macos"] .resume-landscape {
+    background-image: linear-gradient(90deg, var(--mac-paper), rgb(28 39 52 / .86) 65%, rgb(28 39 52 / .62)),
+      url("assets/glacier-wallpaper.png");
+  }
+  [data-platform="macos"] :is(.btn:not(.primary):hover, .icon:hover, .shead .s.active,
+    .reader-chrome-toggle:focus-visible, .reader-chrome-toggle:hover, .sidebar-caption:hover,
+    .reader-chrome-collapsed .icon.reader-chrome-toggle, .paper-versions summary:hover,
+    .note-list-item, .notes-list .empty-hint, .paper-number, .import-arrow, .paper-version-row),
+  [data-platform="macos"] #noteQuote {
+    background: var(--mac-field-hover);
+    border-color: var(--stroke-3);
+    box-shadow: none;
+  }
+  [data-platform="macos"] .note-list-item.active {
+    background: var(--accent-soft);
+    border-color: var(--stroke-2);
+  }
+  [data-platform="macos"] :is(.paper-entry.recent, .paper-row:active, #dropZone:hover, #dropZone.over) {
+    background: var(--accent-soft);
+    box-shadow: none;
+    border-color: var(--stroke-2);
+  }
+  [data-platform="macos"] .modal { background-color: rgb(3 8 15 / .52); }
+  [data-platform="macos"] :is(.btn.danger, .btn.danger:hover, #btnDeleteNote, #noteSaveStatus[data-error="true"], .storage-error) {
+    color: var(--mac-danger);
+    background-color: rgb(147 49 65 / .15);
+    border-color: rgb(255 168 180 / .28);
+  }
+  [data-platform="macos"] .thumb.active .tnum { background: var(--mac-primary); border-color: var(--mac-primary); }
+  [data-platform="macos"] .page-slot .pnum { color: #526a7e; }
+  [data-platform="macos"] .sres mark { background: #725a1b; color: #fff1b8; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-platform="macos"] :is(.btn, .icon, .zoom .z, .pgbtn):active:not(:disabled) { transform: none; }
+}
+@media (prefers-reduced-transparency: reduce), (prefers-contrast: more) {
+  [data-platform="macos"] body { background: var(--app-bg); }
+  [data-platform="macos"] .resume-landscape { display: none; }
+  [data-platform="macos"] :is(#topbar, #sidebar:not(.collapsed), #sidebar.collapsed .sidebar-control-cluster,
+    #hud, .library-brandbar, .notes-sidebar, .modal-card, #searchPanel, .selection-toolbar) {
+    background: var(--mac-panel-fill);
+    border-color: var(--stroke-2);
+    box-shadow: none;
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  :root[data-platform="macos"] { --mac-material: var(--mac-panel-fill); }
+}
+
+[data-platform="macos"] .storage-location { grid-template-columns: auto minmax(0, 1fr); }
+[data-platform="macos"] .storage-location-actions { grid-column: 2; display: flex; flex-wrap: wrap; gap: 5px; }
+[data-platform="macos"] #storageBackupHint { margin-top: 12px; }
+@media (max-width: 520px) {
+  [data-platform="macos"] .storage-location { grid-template-columns: minmax(0, 1fr); }
+  [data-platform="macos"] .storage-location-actions { grid-column: 1; }
+}

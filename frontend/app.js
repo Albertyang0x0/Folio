@@ -2,6 +2,9 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
+const isMac = document.documentElement.dataset.platform === "macos";
+const shortcutModifier = isMac ? "⌘" : "Ctrl";
+const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
 const LINE_ZH = 1.55; // 中文译文行距（倍字号）
 
 /* ================= 全局状态 ================= */
@@ -14,10 +17,12 @@ const state = {
 
 const DEFAULT_SETTINGS = {
   api_key: "",
-  model: "deepseek-chat",
+  model: "deepseek-flash",
   base_url: "https://api.deepseek.com",
   target: "简体中文",
+  translation_prompt: "",
   temperature: 0.3,
+  prefetch: 0,
 };
 
 const cur = () => state.tabs[state.active];
@@ -25,10 +30,24 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /* ================= 工具 ================= */
 function loadSettings() {
-  try { return Object.assign({}, DEFAULT_SETTINGS, JSON.parse(localStorage.getItem("paper-reader-settings") || "{}")); }
+  try {
+    const settings = Object.assign({}, DEFAULT_SETTINGS, JSON.parse(localStorage.getItem("paper-reader-settings") || "{}"));
+    if (typeof settings.translation_prompt !== "string") settings.translation_prompt = "";
+    const base = (settings.base_url || DEFAULT_SETTINGS.base_url).trim().replace(/\/+$/, "").toLowerCase();
+    if ((base === DEFAULT_SETTINGS.base_url || base === DEFAULT_SETTINGS.base_url + "/v1") &&
+        ["deepseek-chat", "deepseek-reasoner"].includes(settings.model)) {
+      settings.model = DEFAULT_SETTINGS.model;
+    }
+    return settings;
+  }
   catch (e) { return Object.assign({}, DEFAULT_SETTINGS); }
 }
 function saveSettings(s) { localStorage.setItem("paper-reader-settings", JSON.stringify(s)); }
+
+function translationCacheSettings() {
+  const { base_url, model, target, translation_prompt } = loadSettings();
+  return { base_url, model, target, translation_prompt };
+}
 
 let toastTimer = null;
 function toast(msg, ms) {
@@ -37,6 +56,13 @@ function toast(msg, ms) {
   t.classList.remove("hidden");
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => t.classList.add("hidden"), ms || 4000);
+  return toastTimer;
+}
+
+function dismissToast(timer) {
+  if (timer !== toastTimer) return;
+  clearTimeout(toastTimer);
+  $("toast").classList.add("hidden");
 }
 
 function escapeHtml(s) {
@@ -72,9 +98,16 @@ const ReaderChrome = (() => {
     $('topbar').setAttribute('aria-hidden', String(collapsed));
     const button = $('btnReaderChrome');
     button.setAttribute('aria-expanded', String(!collapsed));
-    button.setAttribute('aria-label', collapsed ? '展开顶部导航' : '收起顶部导航');
-    button.title = collapsed ? '展开顶部导航' : '收起顶部导航';
+    button.setAttribute('aria-label', collapsed ? '显示顶部工具栏' : '隐藏顶部工具栏');
+    button.title = collapsed ? '显示顶部工具栏' : '隐藏顶部工具栏';
+    syncDockedNavigation();
+    if (collapsed) button.focus({ preventScroll: true });
     updateSearchPanelTop();
+    if (reduceMotion.matches) requestAnimationFrame(refreshVisiblePages);
+  }
+
+  function refreshVisiblePages() {
+    if (state.mode === "continuous" && cur() && !$("app").classList.contains("hidden")) renderVisible();
   }
 
   function reveal() {
@@ -89,8 +122,7 @@ const ReaderChrome = (() => {
     });
 
     $('readerChrome').addEventListener('transitionend', (event) => {
-      if (event.propertyName !== 'grid-template-rows') return;
-      if (state.mode === 'continuous' && cur() && !$('app').classList.contains('hidden')) renderVisible();
+      if (event.target === $('readerChrome') && event.propertyName === 'grid-template-rows') refreshVisiblePages();
     });
   }
 
@@ -112,14 +144,14 @@ function saveBookmarks(hash, list) {
 function newTab(id, name, pdfDoc, pagesMeta, outline, pdfData) {
   const tab = {
     id, name, pdfDoc, pagesMeta, outline: outline || [], pdfData,
-    scale: null, duoScale: null, currentPage: 1, mode: "continuous", fitWidth: true,
+    scale: null, duoScale: null, currentPage: 1, mode: "continuous", originalMode: "continuous", fitWidth: true,
     reading: PaperLibrary.get(id)?.reading || null, restoring: false, pendingRestore: null,
-    duoOriginalScale: null, duoShowOriginal: true,
+    duoOriginalScale: null, duoShowOriginal: true, duoSync: false,
     duoFitOriginal: true, duoFitTranslation: true, duoZoomTarget: "translation",
-    translations: {}, translationErrors: {}, inFlight: new Set(), queue: [],
+    translations: {}, translationErrors: {}, inFlight: new Set(), queue: [], translationChecked: new Set(),
     renderToken: 0,
     slots: null, thumbs: null,
-    searchResults: [], searchIdx: -1, searchMatch: null, searchQuery: "", searchLoading: false,
+    searchResults: [], searchIdx: -1, searchMatch: null, searchQuery: "", searchLoading: false, searchScope: "original",
   };
   state.tabs.push(tab);
   return tab;
@@ -127,19 +159,36 @@ function newTab(id, name, pdfDoc, pagesMeta, outline, pdfData) {
 
 function renderTabsBar() {
   const el = $("tabs");
-  el.innerHTML = "";
+  const restoreFocus = el.contains(document.activeElement);
+  const fragment = document.createDocumentFragment();
   state.tabs.forEach((t, i) => {
     const tab = document.createElement("div");
     tab.className = "tab" + (i === state.active ? " active" : "");
-    const name = document.createElement("span");
-    name.className = "tname"; name.textContent = t.name; name.title = t.name;
-    const x = document.createElement("span");
-    x.className = "x"; x.textContent = "×"; x.title = "关闭";
-    tab.appendChild(name); tab.appendChild(x);
-    tab.addEventListener("click", (e) => { e.stopPropagation(); activateTab(i); });
-    x.addEventListener("click", (e) => { e.stopPropagation(); closeTab(i); });
-    el.appendChild(tab);
+    const name = document.createElement("button");
+    name.type = "button";
+    name.className = "tname";
+    name.textContent = name.title = t.name;
+    if (i === state.active) name.setAttribute("aria-current", "true");
+    const close = document.createElement("button");
+    close.type = "button";
+    close.className = "x";
+    close.textContent = "×";
+    close.title = "关闭 " + t.name;
+    close.setAttribute("aria-label", close.title);
+    name.addEventListener("click", () => activateTab(i));
+    close.addEventListener("click", () => closeTab(i));
+    tab.append(name, close);
+    fragment.append(tab);
   });
+  el.replaceChildren(fragment);
+  const active = el.querySelector(".tab.active");
+  if (active) {
+    const tab = active.getBoundingClientRect();
+    const strip = el.getBoundingClientRect();
+    if (tab.right > strip.right) el.scrollLeft += tab.right - strip.right;
+    else if (tab.left < strip.left) el.scrollLeft += tab.left - strip.left;
+  }
+  if (restoreFocus) (el.querySelector(".tab.active .tname") || $("btnLibraryAdd")).focus({ preventScroll: true });
 }
 
 async function activateTab(idx) {
@@ -150,7 +199,7 @@ async function activateTab(idx) {
   searchRun++;
   if (cur()) cur().searchLoading = false;
   readerSearch.cancelJump();
-  readerSearch.detach($("duoOrig").parentElement);
+  readerNotes.unmount($("duoOrig").parentElement);
   duoPaint.original = null;
   cancelSingleRender();
   readerNotes.clearSelection();
@@ -162,12 +211,14 @@ async function activateTab(idx) {
   d.restoring = true;
   d.lastReadActivity = Date.now();
   if (prog) {
-    for (const key of ["mode", "scale", "fitWidth", "duoScale", "duoOriginalScale", "duoFitOriginal", "duoFitTranslation", "duoShowOriginal"]) {
+    for (const key of ["mode", "originalMode", "scale", "fitWidth", "duoScale", "duoOriginalScale", "duoFitOriginal", "duoFitTranslation", "duoShowOriginal", "duoSync"]) {
       if (prog[key] !== undefined) d[key] = prog[key];
     }
   }
   $("searchInput").value = d.searchQuery;
   if (d.searchQuery) $("searchBox").classList.remove("hidden");
+  else $("searchBox").classList.add("hidden");
+  $("searchScope").value = d.searchScope;
   $("btnDocumentSearch").setAttribute("aria-expanded", String(!$("searchBox").classList.contains("hidden")));
   renderSearchPanel();
   ReaderChrome.reveal();
@@ -204,7 +255,7 @@ function closeTab(idx) {
   if (!state.tabs.length) {
     searchRun++;
     readerSearch.cancelJump();
-    readerSearch.detach($("duoOrig").parentElement);
+    readerNotes.unmount($("duoOrig").parentElement);
     state.active = -1;
     $("app").classList.add("hidden");
     setUploadHidden(false);
@@ -227,10 +278,10 @@ function closeTab(idx) {
 function persistCurrentProgress() {
   const d = cur();
   if (!d || d.restoring || $("app").classList.contains("hidden")) return;
-  const reading = { ...(d.reading || {}), page: d.currentPage, mode: state.mode };
+  const reading = { ...(d.reading || {}), page: d.currentPage, mode: state.mode, originalMode: d.originalMode };
   delete reading.legacyScrollTop;
   for (const key of ["scale", "duoScale", "duoOriginalScale"]) reading[key] = d[key] || 1;
-  for (const key of ["fitWidth", "duoFitOriginal", "duoFitTranslation", "duoShowOriginal"]) reading[key] = d[key];
+  for (const key of ["fitWidth", "duoFitOriginal", "duoFitTranslation", "duoShowOriginal", "duoSync"]) reading[key] = d[key];
   const meta = d.pagesMeta[d.currentPage - 1];
   const anchor = (id, scale) => ({ x: $(id).scrollLeft / (meta.width * scale), y: $(id).scrollTop / (meta.height * scale) });
   if (state.mode === "continuous") {
@@ -309,14 +360,9 @@ async function handleFile(file) {
   persistCurrentProgress(); PaperLibrary.flush();
   openingDocument = true;
   setUploadHidden(true);
-  toast("正在解析 PDF…", 2500);
+  const progressToast = toast("正在解析 PDF…", 2500);
   try {
-    const fd = new FormData();
-    fd.append("file", file);
-    const res = await fetch("/api/parse", { method: "POST", body: fd });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.detail || ("解析失败 " + res.status));
-    PaperLibrary.register(data, data.pdf_hash, data.file_name || file.name, data.pages.length);
+    const data = await importPDF(file);
     const existing = state.tabs.findIndex((tab) => tab.id === data.pdf_hash);
     if (existing >= 0) { await activateTab(existing); return; }
     const pdfData = await file.arrayBuffer();
@@ -331,6 +377,43 @@ async function handleFile(file) {
     toast("解析失败：" + e.message, 6000);
     setUploadHidden(false);
   } finally {
+    dismissToast(progressToast);
+    openingDocument = false;
+  }
+}
+
+async function importPDF(file) {
+  if (!/\.pdf$/i.test(file.name)) throw new Error("请选择 PDF 文件");
+  const fd = new FormData();
+  fd.append("file", file);
+  const res = await fetch("/api/parse", { method: "POST", body: fd });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.detail || ("解析失败 " + res.status));
+  PaperLibrary.register(data, data.pdf_hash, data.file_name || file.name, data.pages.length);
+  return data;
+}
+
+async function handleFiles(files) {
+  const selected = Array.from(files);
+  if (selected.length < 2) return handleFile(selected[0]);
+  if (openingDocument) return;
+  openingDocument = true;
+  showLibrary();
+  const failed = [];
+  try {
+    for (let i = 0; i < selected.length; i++) {
+      const file = selected[i];
+      toast(`正在导入 ${i + 1}/${selected.length} · ${file.name}`);
+      try {
+        await importPDF(file);
+      } catch (error) {
+        failed.push(`${file.name}（${error.message}）`);
+      }
+    }
+    PaperLibrary.render();
+    const message = `已导入 ${selected.length - failed.length} 份 PDF`;
+    toast(failed.length ? `${message}，${failed.length} 份失败。 ${failed.slice(0, 2).join("、")}` : message, failed.length ? 9000 : 4000);
+  } finally {
     openingDocument = false;
   }
 }
@@ -342,7 +425,7 @@ async function reopenDoc(hash) {
   if (existing >= 0) return activateTab(existing);
   openingDocument = true;
   setUploadHidden(true);
-  toast("正在打开…", 2500);
+  const progressToast = toast("正在打开…", 2500);
   try {
     const metaRes = await fetch("/api/doc/" + encodeURIComponent(hash));
     if (!metaRes.ok) throw new Error("文档信息不存在，请重新上传");
@@ -360,6 +443,7 @@ async function reopenDoc(hash) {
     toast("打开失败：" + e.message, 6000);
     setUploadHidden(false);
   } finally {
+    dismissToast(progressToast);
     openingDocument = false;
   }
 }
@@ -523,6 +607,51 @@ async function renderSingle() {
 let duoRenderJob = null;
 let duoVisibilityTransition = null;
 const duoPaint = { original: null, translation: null };
+const duoProgrammaticScroll = new WeakMap();
+const duoScroller = (side) => $(side === "original" ? "duoOriginalScroll" : "duoTranslationScroll");
+
+function duoReadingAnchor(scroller, blocks) {
+  const view = scroller.getBoundingClientRect();
+  const page = scroller.querySelector(".duo-page").getBoundingClientRect();
+  const guide = view.top + Math.min(72, view.height * .2) - page.top;
+  const x = view.left + view.width / 2 - page.left;
+  let closest = null, closestDistance = Infinity;
+  for (const block of blocks?.values() || []) {
+    const vertical = Math.max(0, block.top - guide, guide - block.bottom);
+    const horizontal = Math.max(0, block.left - x, x - block.right);
+    const distance = vertical + horizontal * .12;
+    if (distance < closestDistance) {
+      closest = block;
+      closestDistance = distance;
+    }
+  }
+  if (!closest) return null;
+  return { id: closest.id, offset: (guide - closest.top) / Math.max(1, closest.bottom - closest.top) };
+}
+
+function restoreDuoAnchor(scroller, block, offset) {
+  const view = scroller.getBoundingClientRect();
+  const page = scroller.querySelector(".duo-page").getBoundingClientRect();
+  const target = block.top + offset * (block.bottom - block.top);
+  scroller.scrollTop += page.top - view.top + target - Math.min(72, view.height * .2);
+  duoProgrammaticScroll.set(scroller, scroller.scrollTop);
+}
+
+function syncDuoScroll(side, fromEvent = false) {
+  const d = cur(), scroller = duoScroller(side);
+  if (fromEvent && duoProgrammaticScroll.get(scroller) === scroller.scrollTop) {
+    duoProgrammaticScroll.delete(scroller);
+    return;
+  }
+  if (!d?.duoSync || !d.duoShowOriginal || d.restoring || state.mode !== "duo" || duoVisibilityTransition) return;
+  const other = side === "original" ? "translation" : "original";
+  const from = duoPaint[side], to = duoPaint[other], page = d.currentPage - 1;
+  if (from?.doc !== d || to?.doc !== d || from.page !== page || to.page !== page) return;
+  // Restrict the guide to blocks drawn in both panes, including partial translations.
+  const comparable = new Map([...from.blocks].filter(([id]) => to.blocks.has(id)));
+  const anchor = duoReadingAnchor(scroller, comparable);
+  if (anchor) restoreDuoAnchor(duoScroller(other), to.blocks.get(anchor.id), Math.max(-.25, Math.min(1.25, anchor.offset)));
+}
 
 function cancelDuoRender() {
   if (!duoRenderJob) return;
@@ -535,12 +664,17 @@ function sameDuoPaint(a, b) {
     a.dpr === b.dpr && a.revision === b.revision;
 }
 
+function hasTranslatableBlocks(page) {
+  return page.blocks.some((block) => !block.math && !block.skip);
+}
+
 function publishDuoCanvas(side, source, vp, info, draw) {
   const original = side === "original";
   const canvas = $(original ? "duoOrig" : "duoTrans");
-  const scroller = $(original ? "duoOriginalScroll" : "duoTranslationScroll");
+  const scroller = duoScroller(side);
   const previous = duoPaint[side];
   const samePage = previous && previous.doc === info.doc && previous.page === info.page;
+  const anchor = samePage && scroller.scrollTop > 0 ? duoReadingAnchor(scroller, previous.blocks) : null;
   const ratio = samePage ? info.scale / previous.scale : 1;
   const left = samePage && scroller.scrollLeft > 0 ? (scroller.scrollLeft + scroller.clientWidth / 2) * ratio - scroller.clientWidth / 2 : 0;
   const top = samePage && scroller.scrollTop > 0 ? (scroller.scrollTop + scroller.clientHeight / 2) * ratio - scroller.clientHeight / 2 : 0;
@@ -549,9 +683,12 @@ function publishDuoCanvas(side, source, vp, info, draw) {
   canvas.style.height = Math.ceil(vp.height / info.dpr) + "px";
   const ctx = canvas.getContext("2d");
   ctx.drawImage(source, 0, 0);
-  draw(ctx);
+  info.blocks = draw(ctx);
   scroller.scrollLeft = left;
   scroller.scrollTop = top;
+  if (anchor && info.blocks.has(anchor.id) && !info.doc.pendingRestore) {
+    restoreDuoAnchor(scroller, info.blocks.get(anchor.id), anchor.offset);
+  }
   canvas.dataset.pageNumber = info.page + 1;
   duoPaint[side] = info;
   restoreReadingPosition(info.doc, side);
@@ -569,6 +706,7 @@ function publishDuoCanvas(side, source, vp, info, draw) {
     scroller.scrollLeft = late.anchor.x * meta.width * info.scale;
     info.doc.lateTranslationAnchor = null;
   }
+  duoProgrammaticScroll.set(scroller, scroller.scrollTop);
 }
 
 async function renderDuo() {
@@ -580,12 +718,13 @@ async function renderDuo() {
   cancelDuoRender();
   const idx = d.currentPage - 1;
   const meta = d.pagesMeta[idx];
+  const translatable = hasTranslatableBlocks(meta);
   const tr = d.translations[idx];
   updateTranslationNotice(d);
   const original = { doc: d, page: idx, scale: d.duoOriginalScale, dpr: state.dpr,
     revision: null };
   const translated = { doc: d, page: idx, scale: d.duoScale, dpr: state.dpr,
-    revision: tr || (d.inFlight.has(idx) ? "loading" : d.translationErrors[idx] ? "failed" : "empty") };
+    revision: tr || null };
   const needOriginal = d.duoShowOriginal && (!!d.pendingRestore || !!d.hiddenOriginalAnchor || !sameDuoPaint(duoPaint.original, original));
   const needTranslation = !!d.pendingRestore || !sameDuoPaint(duoPaint.translation, translated);
   if (!needOriginal && !needTranslation) return;
@@ -612,29 +751,50 @@ async function renderDuo() {
     if (needOriginal) {
       source = await raster(original.scale);
       if (!active()) return;
-      publishDuoCanvas("original", source.canvas, source.vp, original, () => {});
-      await readerSearch.mountOriginal($("duoOrig").parentElement, d, page, page.getViewport({ scale: original.scale }));
+      publishDuoCanvas("original", source.canvas, source.vp, original, () => {
+        const blocks = new Map();
+        for (const block of meta.blocks) {
+          const r = toViewportRect(block.bbox, source.vp, meta);
+          const { dpr } = original;
+          blocks.set(block.id, { id: block.id, left: r.x / dpr, right: (r.x + r.w) / dpr,
+            top: r.y / dpr, bottom: (r.y + r.h) / dpr });
+        }
+        return blocks;
+      });
+      await readerNotes.mount($("duoOrig").parentElement, d, page, page.getViewport({ scale: original.scale }));
       if (!active()) return;
     }
     if (needTranslation) {
       // 公式/图表裁取始终使用译文倍率的原始 PDF，不依赖左侧是否显示或左侧倍率。
       if (!source || original.scale !== translated.scale) source = await raster(translated.scale);
       if (!active()) return;
+      const host = $("duoTrans").parentElement;
+      readerSearch.detach(host);
+      const textLayer = $("duoTranslationText");
+      textLayer.replaceChildren();
       publishDuoCanvas("translation", source.canvas, source.vp, translated, (ctx) => {
         if (tr) {
-          const map = {};
-          tr.blocks.forEach((b) => { map[b.id] = b.rich_text !== undefined ? b.rich_text : b.text; });
-          (tr.failed_blocks || []).forEach((b) => { map[b.id] = "〔此段翻译未完成，请重试〕"; });
-          reflowPage(ctx, source.canvas, meta, map, source.vp, translated.scale, state.dpr);
-        } else {
-          ctx.fillStyle = "rgba(255,255,255,0.55)";
-          ctx.fillRect(0, 0, ctx.canvas.width, ctx.canvas.height);
-          ctx.fillStyle = "#475569";
-          ctx.font = (15 * state.dpr) + "px 'Microsoft YaHei', sans-serif";
-          const msg = translated.revision === "loading" ? "翻译中…" : translated.revision === "failed" ? "翻译未完成，请重试" : "尚未翻译";
-          ctx.fillText(msg, (ctx.canvas.width - ctx.measureText(msg).width) / 2, ctx.canvas.height / 2);
+          const text = {};
+          tr.blocks.forEach((b) => { text[b.id] = b.rich_text ?? b.text; });
+          if (tr.complete === false) {
+            for (const block of meta.blocks) {
+              if (!block.skip && !block.math && text[block.id] === undefined) {
+                text[block.id] = block.translation_text ?? block.text;
+              }
+            }
+          }
+          const layout = reflowPage(ctx, source.canvas, meta, text, source.vp, translated.scale, state.dpr);
+          readerSearch.attachTranslation(host, d, idx, textLayer, layout, tr.blocks);
+          return layout;
         }
+        if (translatable) {
+          ctx.fillStyle = "#fff";
+          ctx.fillRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+        }
+        return new Map();
       });
+      if (d.duoSync && !d.pendingRestore && !d.searchMatch) syncDuoScroll(d.duoZoomTarget);
+      readerSearch.refresh(d);
     }
   } catch (e) {
     if (active() && e.name !== "RenderingCancelledException") {
@@ -791,7 +951,7 @@ function layoutInlineText(ctx, text, block, fs, maxW, firstIndent, meta, vp) {
     for (const slice of slices) {
       slice.x *= fit; slice.y *= fit; slice.w *= fit; slice.h *= fit;
     }
-    units.push({ type: "math", token: m.token, slices, padding,
+    units.push({ type: "math", text: m.text, slices, padding,
       width: imageW * fit + padding * 2, imageW: imageW * fit, imageH: imageH * fit,
       ascent: Math.max(0, ascent * fit), descent: Math.max(0, descent * fit) });
     pos = match.index + match[0].length;
@@ -937,8 +1097,45 @@ function detectColumns(meta, excludedIds) {
   return columns;
 }
 
+function recordDuoLine(ctx, layout, block, line, rich, x, baseline, dpr) {
+  const baseFont = ctx.font;
+  const runs = rich ? line.runs : [{ text: line, width: ctx.measureText(line).width, font: baseFont }];
+  let cursor = x;
+  const positioned = [];
+  for (const run of runs) {
+    if (run.text) {
+      ctx.font = run.font || baseFont;
+      const measured = ctx.measureText(run.text);
+      const ascent = measured.fontBoundingBoxAscent || parseFloat(ctx.font.match(/[\d.]+px/)[0]) * .8;
+      const descent = measured.fontBoundingBoxDescent || ascent * .25;
+      positioned.push({
+        text: run.text,
+        left: cursor / dpr,
+        top: (baseline - ascent) / dpr,
+        width: run.width / dpr,
+        naturalWidth: measured.width / dpr,
+        height: (ascent + descent) / dpr,
+        font: ctx.font.replace(/([\d.]+)px/, (_, size) => Number(size) / dpr + "px"),
+      });
+    }
+    cursor += run.width;
+  }
+  ctx.font = baseFont;
+  if (!positioned.length) return;
+  const top = Math.min(...positioned.map((run) => run.top));
+  const bottom = Math.max(...positioned.map((run) => run.top + run.height));
+  const old = layout.get(block.id);
+  const record = old || { id: block.id, top, bottom, left: x / dpr, right: cursor / dpr, lines: [] };
+  record.top = Math.min(record.top, top);
+  record.bottom = Math.max(record.bottom, bottom);
+  record.left = Math.min(record.left, x / dpr);
+  record.right = Math.max(record.right, cursor / dpr);
+  record.lines.push(positioned);
+  layout.set(block.id, record);
+}
+
 // 首页页眉按原始纵向位置居中绘制；译文换行时向下扩展，但不侵入摘要区。
-function drawCoverHeader(ctx, blocks, map, meta, vp, scale, dpr, fam, src, measureOnly) {
+function drawCoverHeader(ctx, blocks, map, meta, vp, scale, dpr, fam, src, layout) {
   if (!blocks.length) return 0;
   const ordered = blocks.slice().sort((a, b) => a.bbox[1] - b.bbox[1]);
   const centerX = ctx.canvas.width / 2;
@@ -961,9 +1158,10 @@ function drawCoverHeader(ctx, blocks, map, meta, vp, scale, dpr, fam, src, measu
     for (const line of lines) {
       if (rich) baseline = Math.max(baseline, previousBottom + line.ascent);
       const x = centerX - (rich ? line.width : ctx.measureText(line).width) / 2;
-      if (!measureOnly) {
+      if (layout) {
         if (rich) drawInlineLine(ctx, line, x, baseline, src);
         else ctx.fillText(line, x, baseline);
+        recordDuoLine(ctx, layout, b, line, rich, x, baseline, dpr);
       }
       previousBottom = baseline + (rich ? line.descent : fs * 0.28);
       baseline += lineH;
@@ -1000,10 +1198,9 @@ function reflowPage(ctx, src, meta, map, vp, scale, dpr) {
     col.bottom = Math.max(col.bottom, b.bbox[3]);
   }
   for (const col of cols) col.blocks.sort((a, b) => a.bbox[1] - b.bbox[1] || a.id - b.id);
-  if (!cols.length && !coverHeader.length) return;
-  const hasInlineMath = meta.blocks.some((b) => !b.math && !b.skip && b.inline_math && b.inline_math.length);
-  const allowOverflow = hasInlineMath || equations.length > 0;
-  const headerBottom = drawCoverHeader(ctx, coverHeader, map, meta, vp, scale, dpr, fam, src, true);
+  const layout = new Map();
+  if (!cols.length && !coverHeader.length) return layout;
+  const headerBottom = drawCoverHeader(ctx, coverHeader, map, meta, vp, scale, dpr, fam, src);
   // Full-width lead paragraphs (most often an abstract without an explicit
   // heading) are flowed before the two columns, using their original width.
   const spanningFlows = [];
@@ -1014,7 +1211,7 @@ function reflowPage(ctx, src, meta, map, vp, scale, dpr) {
     const obstacles = (meta.protected || []).map((bbox) => toViewportRect(bbox, vp, meta))
       .filter((pr) => pr.x + pr.w > rect.x - 2 && pr.x < rect.x + rect.w + 2);
     const bottom = flowColumn(ctx, rect, [b], map, bodyFs, fam, scale, dpr,
-      obstacles, meta, src, vp, true, true);
+      obstacles, meta, src, vp);
     spanningFlows.push({ rect, block: b, obstacles });
     leadBottom = Math.max(leadBottom, bottom);
   }
@@ -1031,25 +1228,23 @@ function reflowPage(ctx, src, meta, map, vp, scale, dpr) {
     obstacles.sort((a, b) => a.y - b.y);
     return { col, colRect, obstacles };
   });
-  // 高公式增大局部行高时不能再截断页底。先测量，再扩展译文画布；原文页不变。
-  if (allowOverflow) {
-    let neededHeight = Math.max(src.height, leadBottom);
-    for (const f of flows) {
-      const bottom = flowColumn(ctx, f.colRect, f.col.blocks, map, bodyFs, fam, scale, dpr,
-        f.obstacles, meta, src, vp, true, true);
-      neededHeight = Math.max(neededHeight, bottom + 12 * scale * dpr);
-    }
-    if (neededHeight > ctx.canvas.height) {
-      ctx.canvas.height = Math.ceil(neededHeight);
-      if (ctx.canvas.style) ctx.canvas.style.height = Math.ceil(neededHeight / dpr) + "px";
-    }
+  // Measure every column, including plain text that grows in translation.
+  let neededHeight = Math.max(src.height, leadBottom + 12 * scale * dpr);
+  for (const f of flows) {
+    const bottom = flowColumn(ctx, f.colRect, f.col.blocks, map, bodyFs, fam, scale, dpr,
+      f.obstacles, meta, src, vp);
+    neededHeight = Math.max(neededHeight, bottom + 12 * scale * dpr);
+  }
+  if (neededHeight > ctx.canvas.height) {
+    ctx.canvas.height = Math.ceil(neededHeight);
+    ctx.canvas.style.height = Math.ceil(neededHeight / dpr) + "px";
   }
   // 1) 整页填白，擦除所有原文（节编号、被丢弃块等一并清除）
   ctx.save();
   ctx.fillStyle = "#ffffff";
   ctx.fillRect(0, 0, ctx.canvas.width, ctx.canvas.height);
   ctx.restore();
-  // 2) 贴回所有「不翻译」的内容：保护区 + math/skip 块（公式/表格/引用/图注原样）
+  // 2) 贴回保护区和跳过重排的块（公式、表格数据、参考文献等）。
   const restore = (rect) => {
     const pr = toViewportRect(rect, vp, meta);
     const cw = ctx.canvas.width, ch = ctx.canvas.height;
@@ -1063,25 +1258,25 @@ function reflowPage(ctx, src, meta, map, vp, scale, dpr) {
   }
   for (const rect of (meta.protected || [])) restore(rect);
   // 3) 首页页眉独立居中绘制，不参与正文栏宽度计算
-  drawCoverHeader(ctx, coverHeader, map, meta, vp, scale, dpr, fam, src, false);
+  drawCoverHeader(ctx, coverHeader, map, meta, vp, scale, dpr, fam, src, layout);
   // 4) 双栏之前的跨栏导语按原始宽度排版
   for (const f of spanningFlows) {
     flowColumn(ctx, f.rect, [f.block], map, bodyFs, fam, scale, dpr,
-      f.obstacles, meta, src, vp, false, true);
+      f.obstacles, meta, src, vp, layout);
   }
   // 5) 各栏流动排版译文（避开保护区块）
   for (const f of flows) {
     flowColumn(ctx, f.colRect, f.col.blocks, map, bodyFs, fam, scale, dpr,
-      f.obstacles, meta, src, vp, false, allowOverflow);
+      f.obstacles, meta, src, vp, layout);
   }
+  return layout;
 }
 
 // 单栏流动排版：逐行写入译文，遇到保护区整体下移到其下方，保证不重叠、不截断
-function flowColumn(ctx, colRect, blocks, map, bodyFs, fam, scale, dpr, obstacles, meta, src, vp, measureOnly, allowOverflow) {
+function flowColumn(ctx, colRect, blocks, map, bodyFs, fam, scale, dpr, obstacles, meta, src, vp, layout) {
   const fs0 = bodyFs * scale * dpr;
   let y = colRect.y + fs0 * 0.9;
   let previousBottom = null;
-  const maxBottom = (meta.height - 12) * scale * dpr;
   for (const b of blocks) {
     if (b.math && b.display_math && !b.skip) {
       const r = toViewportRect(b.bbox, vp, meta);
@@ -1096,7 +1291,7 @@ function flowColumn(ctx, colRect, blocks, map, bodyFs, fam, scale, dpr, obstacle
         if (!hit) break;
         top = hit.y + hit.h + fs0 * 0.65;
       }
-      if (!measureOnly) ctx.drawImage(src, r.x, r.y, r.w, r.h, x, top, w, h);
+      if (layout) ctx.drawImage(src, r.x, r.y, r.w, r.h, x, top, w, h);
       previousBottom = top + h;
       y = previousBottom + fs0 * 1.5;
       continue;
@@ -1135,136 +1330,166 @@ function flowColumn(ctx, colRect, blocks, map, bodyFs, fam, scale, dpr, obstacle
         top = y - ascent;
         bot = y + descent;
       }
-      if (!allowOverflow && bot > maxBottom) break;
-      if (!measureOnly) {
-        if (rich) drawInlineLine(ctx, lines[i], colRect.x + lines[i].indent, y, src);
-        else ctx.fillText(lines[i], colRect.x + (i === 0 ? lines.firstIndent : 0), y);
+      if (layout) {
+        const line = lines[i];
+        const x = colRect.x + (rich ? line.indent : i === 0 ? lines.firstIndent : 0);
+        if (rich) drawInlineLine(ctx, line, x, y, src);
+        else ctx.fillText(line, x, y);
+        recordDuoLine(ctx, layout, b, line, rich, x, y, dpr);
       }
       previousBottom = bot;
       y += lh;
     }
     y += fs * 0.35; // 段间距
-    if (!allowOverflow && y > maxBottom) break;
   }
   return Math.max(y, previousBottom || colRect.y);
 }
 
-/* ================= 页级滑动窗口翻译 ================= */
-let workerCount = 0;
+/* ================= 页级翻译 ================= */
+let translationWorker = false;
+let translationPaused = false;
+let translationGeneration = 0;
 
-async function ensureDuoWindow() {
-  const d = cur(); if (!d) return;
-  if (!loadSettings().api_key.trim()) {
-    openSettings();
-    toast("请先填写 DeepSeek API Key");
-    return;
-  }
-  const total = d.pagesMeta.length;
-  const center = d.currentPage - 1;
-  const want = [];
-  for (let p = center - 3; p <= center + 3; p++) {
-    if (p >= 0 && p < total && d.pagesMeta[p].blocks.length) want.push(p);
-  }
-  const pending = want.filter((p) => !d.translations[p] && !d.translationErrors[p] && !d.inFlight.has(p));
-  if (pending.length) {
-    pending.forEach((p) => d.inFlight.add(p));
-    d.queue.push(...pending);
-    runWorkers();
-  }
-  updateDuoStatus(want.length);
+function ensureDuoWindow() {
+  const d = cur();
+  if (!d || state.mode !== "duo" || $("app").classList.contains("hidden")) return;
+  const settings = loadSettings();
+  const page = d.currentPage - 1;
+  const configuredRadius = Number(settings.prefetch);
+  const radius = !translationPaused && settings.api_key && [1, 3].includes(configuredRadius) ? configuredRadius : 0;
+  const pages = [page];
+  for (let offset = 1; offset <= radius; offset++) pages.push(page + offset, page - offset);
+  d.queue = pages.filter((p) => {
+    const meta = d.pagesMeta[p];
+    if (!meta || !hasTranslatableBlocks(meta) || d.inFlight.has(p) || d.translationErrors[p]) return false;
+    if (d.translations[p] && d.translations[p].complete !== false) return false;
+    return (!translationPaused && settings.api_key) || !d.translationChecked.has(p);
+  });
+  runWorkers();
+  updateTranslationNotice(d);
 }
 
 function runWorkers() {
-  const d = cur(); if (!d) return;
-  while (workerCount < 3 && d.queue.length) {
-    const p = d.queue.shift();
-    workerCount++;
-    translateOne(d, p).finally(() => { workerCount--; runWorkers(); });
-  }
+  const d = cur();
+  if (translationWorker || !d?.queue.length || state.mode !== "duo" || $("app").classList.contains("hidden")) return;
+  const page = d.queue.shift();
+  translationWorker = true;
+  d.inFlight.add(page);
+  translateOne(d, page).finally(() => {
+    d.inFlight.delete(page);
+    translationWorker = false;
+    const active = cur();
+    if (active && state.mode === "duo" && !$("app").classList.contains("hidden")) {
+      ensureDuoWindow();
+      if (active === d && page === d.currentPage - 1) renderDuo();
+    }
+  });
 }
 
-async function translateOne(d, p) {
+async function translateOne(d, page) {
   const settings = loadSettings();
-  let ok = false;
-  let lastErr = null;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      const res = await fetch("/api/translate_page", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ pdf_hash: d.id, page: p, settings }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok || data.complete === false) {
-        if (data.code === "translation_incomplete") {
-          // The backend has already retried each failed segment. Retain partial
-          // progress and wait for an explicit retry instead of looping on scroll.
-          if (data.blocks?.length) d.translations[p] = data;
-          d.translationErrors[p] = data;
-          break;
-        }
-        const error = new Error(typeof data.detail === "string" ? data.detail : `翻译请求失败（HTTP ${res.status}）`);
-        error.retryable = res.status === 429 || res.status >= 500;
-        throw error;
-      }
-      d.translations[p] = data;
-      delete d.translationErrors[p];
-      ok = true;
-      break;
-    } catch (e) {
-      lastErr = e;
-      if (e.retryable === false) break;
-      if (attempt < 2) await sleep(1500 * (attempt + 1));
+  const generation = translationGeneration;
+  const cacheOnly = translationPaused || !settings.api_key;
+  d.cachedLookupPage = cacheOnly ? page : null;
+  try {
+    const response = await fetch("/api/translate_page", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pdf_hash: d.id, page, settings, cached_only: cacheOnly }),
+    });
+    const data = await response.json();
+    if (generation !== translationGeneration) return;
+    if (response.ok || data.code === "translation_incomplete") {
+      if (data.blocks?.length || (response.ok && data.complete !== false)) d.translations[page] = data;
+      d.translationChecked.add(page);
+      if (!response.ok) d.translationErrors[page] = data;
+      else delete d.translationErrors[page];
+      return;
     }
-  }
-  d.inFlight.delete(p);
-  if (!ok && !d.translationErrors[p]) d.translationErrors[p] = {
-    detail: lastErr?.message || "翻译未完成，请重试", code: "request_failed",
-  };
-  if (cur() === d && state.mode === "duo") {
-    if (d.currentPage - 1 === p) renderDuo();
-    updateDuoStatus();
+    throw new Error(typeof data.detail === "string" ? data.detail : `翻译请求失败（HTTP ${response.status}）`);
+  } catch (error) {
+    if (generation === translationGeneration) {
+      d.translationErrors[page] = { detail: error.message || "无法连接本机翻译服务", code: "request_failed" };
+    }
   }
 }
 
 function updateTranslationNotice(d) {
   const p = d.currentPage - 1;
   const error = d.translationErrors[p];
-  $("translationNotice").classList.toggle("hidden", !error);
-  if (!error) return;
+  const result = d.translations[p];
   const busy = d.inFlight.has(p);
-  $("translationMessage").textContent = busy ? "正在重试未完成段落，已成功的译文会保留…" : error.detail;
-  $("btnRetryTranslation").disabled = busy;
-  $("btnRetryTranslation").textContent = busy ? "重试中…" : "重试未完成段落";
+  const queued = d.queue.includes(p);
+  const needsKey = !loadSettings().api_key;
+  const backgroundPage = [...d.inFlight].find((page) => page !== p && page !== d.cachedLookupPage);
+  const showError = Boolean(error && !busy && !queued);
+  const showSetup = needsKey && !busy && !queued && !result?.blocks?.length && hasTranslatableBlocks(d.pagesMeta[p]);
+  const notice = $("translationNotice");
+  const explanation = $("translationMessage");
+  notice.classList.toggle("hidden", !showError && !showSetup);
+  notice.classList.toggle("translation-setup", showSetup && !showError);
+  const detail = showError ? error.detail : showSetup ? "配置翻译服务后即可查看译文。" : "";
+  if (explanation.textContent !== detail) explanation.textContent = detail;
+  $("btnRetryTranslation").textContent = needsKey ? "打开设置" : "重试";
+
+  let status = "待翻译";
+  let tone = "idle";
+  if (busy || queued) {
+    const cacheLookup = busy ? d.cachedLookupPage === p : translationPaused || needsKey;
+    status = cacheLookup ? "检查缓存" : busy ? "翻译中…" : "已排队";
+    tone = "working";
+  } else if (showError) {
+    status = result?.blocks?.length ? "译文未完成" : "翻译失败";
+    tone = "error";
+  } else if (backgroundPage !== undefined) {
+    status = `翻译第 ${backgroundPage + 1} 页`;
+    tone = "working";
+  } else if (translationPaused) {
+    status = "已暂停";
+    tone = "paused";
+  } else if (!hasTranslatableBlocks(d.pagesMeta[p])) {
+    status = "无需翻译";
+  } else if (result && result.complete !== false) {
+    status = "译文就绪";
+    tone = "ready";
+  } else if (needsKey) {
+    status = "未配置";
+  }
+
+  const queueStatus = $("translationQueueStatus");
+  if (queueStatus.textContent !== status) queueStatus.textContent = status;
+  queueStatus.dataset.tone = tone;
+  const pending = d.queue.map((page) => `第 ${page + 1} 页`).join("、");
+  queueStatus.title = pending ? `${status} · 排队中：${pending}` : status;
+
+  const pause = $("btnPauseTranslation");
+  const action = needsKey ? "settings" : translationPaused ? "resume" : "pause";
+  const label = { settings: "打开翻译设置", resume: "继续翻译", pause: "暂停翻译" }[action];
+  pause.dataset.action = action;
+  pause.title = label;
+  pause.setAttribute("aria-label", label);
+  $("translationActionLabel").textContent = label;
+}
+
+function toggleTranslationPause() {
+  translationPaused = !translationPaused;
+  ensureDuoWindow();
+  if (cur() && state.mode === "duo") renderDuo();
 }
 
 $("btnRetryTranslation").onclick = () => {
-  const d = cur(); if (!d) return;
-  const p = d.currentPage - 1;
-  if (d.inFlight.has(p)) return;
-  if (!loadSettings().api_key.trim()) { openSettings(); return; }
-  d.inFlight.add(p);
-  d.queue.unshift(p);
-  updateTranslationNotice(d);
-  runWorkers();
+  const d = cur();
+  if (!d) return;
+  if (!loadSettings().api_key) { openSettings(); return; }
+  if (translationPaused) translationPaused = false;
+  delete d.translationErrors[d.currentPage - 1];
+  ensureDuoWindow();
+  renderDuo();
 };
-
-function updateDuoStatus(totalHint) {
-  // 「已缓存 x/x 页」UI 已移除，不再显示；此处保留为 no-op，避免改动其它调用方。
-  const el = $("duoStatus");
-  if (!el) return;
-  const d = cur(); if (!d) return;
-  const center = d.currentPage - 1;
-  let done = 0, total = 0;
-  for (let p = center - 3; p <= center + 3; p++) {
-    if (p < 0 || p >= d.pagesMeta.length || !d.pagesMeta[p].blocks.length) continue;
-    total++;
-    if (d.translations[p]) done++;
-  }
-  if (total === 0) { el.textContent = ""; return; }
-  if (done >= total) el.textContent = "已缓存 " + done + "/" + total + " 页";
-  else el.textContent = "已缓存 " + done + "/" + total + " 页 · 后台翻译中…";
-}
+$("btnPauseTranslation").addEventListener("click", () => {
+  if (!loadSettings().api_key) openSettings();
+  else toggleTranslationPause();
+});
 
 /* ================= 视图模式 ================= */
 function fitDuoScale(d, side) {
@@ -1281,12 +1506,10 @@ function applyDuoOriginalVisibility(d) {
   $("duoView").querySelector(".duo-body").classList.toggle("original-collapsed", collapsed);
   $("duoOriginalPane").inert = collapsed;
   $("duoOriginalPane").setAttribute("aria-hidden", String(collapsed));
-  $("btnToggleOriginal").textContent = collapsed ? "显示原文" : "隐藏原文";
-  $("btnToggleOriginal").setAttribute("aria-expanded", String(!collapsed));
 }
 
 function waitForDuoVisibilityMotion() {
-  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return Promise.resolve();
+  if (reduceMotion.matches) return Promise.resolve();
   const pane = $("duoOriginalPane");
   return new Promise((resolve) => {
     let finished = false;
@@ -1300,7 +1523,7 @@ function waitForDuoVisibilityMotion() {
     const onEnd = (event) => {
       if (event.target === pane && event.propertyName === "flex-grow") finish();
     };
-    const timer = setTimeout(finish, 500);
+    const timer = setTimeout(finish, isMac ? 350 : 500);
     pane.addEventListener("transitionend", onEnd);
   });
 }
@@ -1334,10 +1557,15 @@ function fitDuoWidth(side) {
   renderDuo().then(persistCurrentProgress);
 }
 
-async function toggleDuoOriginal() {
+async function setDuoOriginalVisibility(show) {
   const d = cur(); if (!d || state.mode !== "duo") return;
+  if (duoVisibilityTransition) {
+    await duoVisibilityTransition;
+    if (cur() !== d || state.mode !== "duo") return;
+  }
+  if (d.duoShowOriginal === show) return;
   persistCurrentProgress();
-  d.duoShowOriginal = !d.duoShowOriginal;
+  d.duoShowOriginal = show;
   if (!d.duoShowOriginal && d.reading?.original) d.hiddenOriginalAnchor = { page: d.currentPage, anchor: d.reading.original };
   if (!d.duoShowOriginal) d.duoZoomTarget = "translation";
   cancelDuoRender();
@@ -1345,33 +1573,98 @@ async function toggleDuoOriginal() {
   duoRenderJob = layoutJob;
   const motion = waitForDuoVisibilityMotion();
   duoVisibilityTransition = motion;
-  $("btnToggleOriginal").disabled = true;
   applyDuoOriginalVisibility(d);
+  updateReaderView();
   try {
     await motion;
   } finally {
     if (duoVisibilityTransition === motion) duoVisibilityTransition = null;
     if (duoRenderJob === layoutJob) duoRenderJob = null;
-    $("btnToggleOriginal").disabled = false;
   }
   if (cur() !== d || state.mode !== "duo") return;
   await renderDuo();
   persistCurrentProgress();
 }
 
+function setDuoZoomTarget(side) {
+  const d = cur();
+  if (!d || (side === "original" && !d.duoShowOriginal)) return;
+  d.duoZoomTarget = side;
+  updateZoomLabel();
+}
+
 function updateZoomLabel() {
   const d = cur(); if (!d) return;
-  const s = state.mode === "duo" ? (d.duoScale || d.scale) : d.scale;
-  $("zoomVal").textContent = Math.round(s * 100) + "%";
-  $("btnFitWidth").setAttribute("aria-pressed", String(d.fitWidth));
-  for (const [prefix, scale, fit] of [
-    ["Orig", d.duoOriginalScale, d.duoFitOriginal], ["Trans", d.duoScale, d.duoFitTranslation],
-  ]) {
-    $(prefix === "Orig" ? "origZoomVal" : "transZoomVal").textContent = Math.round((scale || 1) * 100) + "%";
-    $("btn" + prefix + "Fit").setAttribute("aria-pressed", String(fit));
-    $("btn" + prefix + "ZoomOut").disabled = scale <= 0.25;
-    $("btn" + prefix + "ZoomIn").disabled = scale >= 4;
+  const dual = state.mode === "duo";
+  const side = d.duoShowOriginal ? d.duoZoomTarget : "translation";
+  const original = side === "original";
+  const scale = (dual ? (original ? d.duoOriginalScale : d.duoScale) : d.scale) || 1;
+  const fit = dual ? (original ? d.duoFitOriginal : d.duoFitTranslation) : d.fitWidth;
+  $("duoZoomTarget").value = side;
+  $("zoomVal").textContent = Math.round(scale * 100) + "%";
+  $("btnZoomOut").disabled = scale <= (dual ? 0.25 : 0.3);
+  $("btnZoomIn").disabled = scale >= 4;
+  $("btnFitWidth").setAttribute("aria-pressed", String(fit));
+  $("btnDuoSync").setAttribute("aria-pressed", String(d.duoSync));
+}
+
+function syncDockedNavigation() {
+  const sidebar = $("sidebar");
+  const viewer = $("viewer");
+  const cluster = $("sidebarControlCluster");
+  const dock = $("readerNavigationDock");
+  const collapsed = sidebar.classList.contains("collapsed");
+  const immersive = $("app").classList.contains("reader-chrome-collapsed");
+  const inline = immersive && collapsed;
+  const destination = immersive ? (inline ? dock : sidebar) : $("readerNavigationSlot");
+
+  dock.classList.toggle("hidden", !inline);
+  viewer.classList.toggle("has-docked-navigation", inline);
+  if (cluster.parentElement !== destination) {
+    const focused = cluster.contains(document.activeElement) ? document.activeElement : null;
+    destination.prepend(cluster);
+    focused?.focus({ preventScroll: true });
   }
+}
+
+function updateReaderView() {
+  const d = cur();
+  const translating = state.mode === "duo";
+  const compare = translating && d?.duoShowOriginal;
+  const selected = translating ? (compare ? "duo" : "translation") : "original";
+  $("viewSeg").dataset.activeMode = selected;
+  for (const button of $("viewSeg").querySelectorAll("button")) {
+    const active = button.dataset.view === selected;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  }
+  $("readerPairTools").classList.toggle("hidden", !compare);
+  $("readerFlowOptions").classList.toggle("hidden", translating);
+  $("readerTranslationActions").classList.toggle("hidden", !translating);
+  $("translationQueueStatus").classList.toggle("hidden", !translating);
+  for (const button of $("readerFlowOptions").querySelectorAll("button")) {
+    button.setAttribute("aria-pressed", String(button.dataset.flow === d?.originalMode));
+  }
+  updateZoomLabel();
+}
+
+async function selectReaderView(view) {
+  const d = cur();
+  if (!d) return;
+  if (view === "original") {
+    if (state.mode === "duo") await applyMode(d.originalMode);
+    return;
+  }
+  const showOriginal = view === "duo";
+  if (duoVisibilityTransition) await duoVisibilityTransition;
+  if (cur() !== d) return;
+  if (state.mode === "duo") {
+    await setDuoOriginalVisibility(showOriginal);
+    return;
+  }
+  d.duoShowOriginal = showOriginal;
+  if (!showOriginal) d.duoZoomTarget = "translation";
+  await applyMode("duo");
 }
 
 function applyMode(mode, restoring = false) {
@@ -1382,27 +1675,33 @@ function applyMode(mode, restoring = false) {
   }
   readerNotes.clearSelection();
   if (mode !== "single") cancelSingleRender();
-  if (mode !== "duo") cancelDuoRender();
+  if (mode !== "duo") {
+    cancelDuoRender();
+    if (state.mode === "duo") {
+      readerNotes.unmount($("duoOrig").parentElement);
+      readerSearch.detach($("duoTrans").parentElement);
+      duoPaint.original = duoPaint.translation = null;
+    }
+  }
   state.mode = mode;
-  document.querySelectorAll("#viewSeg .v").forEach((b) => b.classList.toggle("active", b.dataset.mode === mode));
-  $("viewSeg").dataset.activeMode = mode;
-  document.querySelectorAll("#viewSeg .v").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.mode === mode)));
+  syncSearchScope();
   $("continuousView").classList.toggle("hidden", mode !== "continuous");
   $("singleView").classList.toggle("hidden", mode !== "single");
   $("duoView").classList.toggle("hidden", mode !== "duo");
-  $("zoomControls").classList.toggle("hidden", mode === "duo");
+  syncDockedNavigation();
   readerNotes.sync();
   const d = cur();
   if (!d) return;
   d.mode = mode;
-  updateZoomLabel();
+  if (mode !== "duo") d.originalMode = mode;
+  updateReaderView();
   let rendered;
   if (mode === "continuous") {
     if (restoring) restoreReadingPosition(d);
     else { scrollToPage(d.currentPage); renderVisible(); }
   }
   else if (mode === "single") rendered = renderSingle();
-  else if (mode === "duo") { rendered = renderDuo(); ensureDuoWindow(); }
+  else if (mode === "duo") { ensureDuoWindow(); rendered = renderDuo(); }
   readerSearch.refresh(d);
   if (d.searchMatch && d.currentPage === d.searchMatch.page + 1) readerSearch.select(d, d.searchMatch);
   return Promise.resolve(rendered).then(() => { if (cur() === d && !restoring) persistCurrentProgress(); });
@@ -1416,6 +1715,9 @@ function setCurrentLabel(n) {
   d.currentPage = n;
   $("pageInput").value = n;
   $("pageCount").textContent = total;
+  $("pageInput").max = total;
+  $("btnPrev").disabled = n <= 1;
+  $("btnNext").disabled = n >= total;
   updateThumbActive();
 }
 
@@ -1428,9 +1730,39 @@ function goToPage(n) {
   d.pendingRestore = null; d.restoring = false; d.lateTranslationAnchor = null; d.hiddenOriginalAnchor = null;
   setCurrentLabel(n);
   if (state.mode === "continuous") { scrollToPage(n); renderVisible(); }
-  else if (state.mode === "single") renderSingle().then(persistCurrentProgress);
-  else if (state.mode === "duo") { renderDuo().then(persistCurrentProgress); ensureDuoWindow(); }
+  else if (state.mode === "single") return renderSingle().then(persistCurrentProgress);
+  else if (state.mode === "duo") { ensureDuoWindow(); return renderDuo().then(persistCurrentProgress); }
   if (state.mode === "continuous") persistCurrentProgress();
+}
+
+async function readOverviewSource(doc, source) {
+  if (cur() !== doc) return;
+  const meta = doc.pagesMeta[source.page - 1];
+  if (!meta) return;
+  await selectReaderView("original");
+  if (cur() !== doc) return;
+  await goToPage(source.page);
+  const block = meta.blocks.find((item) => item.id === source.block);
+  if (!block) return;
+  try {
+    const page = await doc.pdfDoc.getPage(source.page);
+    if (cur() !== doc || doc.currentPage !== source.page || state.mode === "duo") return;
+    const host = state.mode === "continuous" ? doc.slots[source.page - 1]?.el : $("singlePage");
+    if (!host) return;
+    const r = toViewportRect(block.bbox, page.getViewport({ scale: doc.scale }), meta);
+    document.querySelector(".overview-source-mark")?.remove();
+    const mark = document.createElement("div");
+    mark.className = "overview-source-mark";
+    mark.setAttribute("aria-hidden", "true");
+    Object.assign(mark.style, { left: r.x + "px", top: r.y + "px", width: r.w + "px", height: r.h + "px" });
+    host.append(mark);
+    mark.scrollIntoView({ block: "center", inline: "nearest", behavior: "instant" });
+    if (state.mode === "continuous") renderVisible();
+    persistCurrentProgress();
+    setTimeout(() => mark.remove(), 3600);
+  } catch (_) {
+    // The reader has already opened the cited page.
+  }
 }
 
 /* ================= 缩放 ================= */
@@ -1652,14 +1984,55 @@ function switchSidebar(tab) {
   $("thumbsPanel").classList.toggle("hidden", tab !== "thumbs");
   $("outlinePanel").classList.toggle("hidden", tab !== "outline");
   $("bookmarksPanel").classList.toggle("hidden", tab !== "bookmarks");
+  $("searchPanel").classList.toggle("hidden", tab !== "search");
 }
 
 /* ================= 全文搜索 ================= */
 let searchRun = 0;
+let lastSearchResults = null;
+let sidebarBeforeSearch = "thumbs";
+
+function syncSearchScope() {
+  const d = cur();
+  if (!d) return;
+  const scope = $("searchScope");
+  scope.classList.toggle("hidden", state.mode !== "duo");
+  if (state.mode !== "duo" && d.searchScope === "translation") {
+    scope.value = d.searchScope = "original";
+    if (d.searchQuery && !$("searchBox").classList.contains("hidden")) runSearch(d.searchQuery);
+  }
+}
+
+async function findTranslated(d, query) {
+  const response = await fetch("/api/cached_translations", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ pdf_hash: d.id, settings: translationCacheSettings() }),
+  });
+  if (!response.ok) throw new Error("无法读取已保存的译文");
+  const { pages } = await response.json();
+  const results = [];
+  const match = query.toLowerCase();
+  for (const { page, blocks } of pages) {
+    for (const block of blocks) {
+      const haystack = block.text.toLowerCase();
+      let idx = -match.length;
+      while ((idx = haystack.indexOf(match, idx + match.length)) !== -1) {
+        results.push({ page, blockId: block.id, text: block.text, idx, end: idx + match.length, scope: "translation" });
+      }
+    }
+  }
+  return { results, translatedPages: pages.length };
+}
 
 function openSearch() {
   ReaderChrome.reveal();
+  if ($("searchBox").classList.contains("hidden")) {
+    sidebarBeforeSearch = document.querySelector(".shead .s.active")?.dataset.tab || "thumbs";
+  }
+  if ($("sidebar").classList.contains("collapsed")) $("btnSidebar").click();
   $("searchBox").classList.remove("hidden");
+  syncSearchScope();
   $("btnDocumentSearch").setAttribute("aria-expanded", "true");
   $("searchInput").focus();
   $("searchInput").select();
@@ -1667,10 +2040,10 @@ function openSearch() {
 
 function closeSearch() {
   searchRun++;
-  const restoreFocus = $("searchBox").contains(document.activeElement);
+  const restoreFocus = $("searchBox").contains(document.activeElement) || $("searchPanel").contains(document.activeElement);
   $("searchBox").classList.add("hidden");
   $("btnDocumentSearch").setAttribute("aria-expanded", "false");
-  $("searchPanel").classList.add("hidden");
+  if (!$("searchPanel").classList.contains("hidden")) switchSidebar(sidebarBeforeSearch);
   $("searchInput").value = "";
   const d = cur();
   if (d) {
@@ -1694,14 +2067,18 @@ async function runSearch(query) {
   d.searchQuery = q; d.searchLoading = !!q;
   clearHighlights(); renderSearchPanel();
   if (!q) return;
+  switchSidebar("search");
   const active = () => token === searchRun && cur() === d;
   try {
-    const results = await readerSearch.find(d, q, active);
+    const translated = d.searchScope === "translation";
+    const found = translated ? await findTranslated(d, q) : { results: await readerSearch.find(d, q, active) };
     if (!active()) return;
-    d.searchResults = results; d.searchLoading = false;
-    d.searchIdx = results.length ? 0 : -1;
+    d.searchResults = found.results;
+    d.searchLoading = false;
+    d.translatedSearchPages = found.translatedPages;
+    d.searchIdx = found.results.length ? 0 : -1;
     renderSearchPanel();
-    if (results.length) goToMatch(0);
+    if (found.results.length) goToMatch(0);
   } catch (error) {
     if (!active()) return;
     d.searchLoading = false; renderSearchPanel();
@@ -1721,36 +2098,79 @@ function buildSnippet(text, idx, qlen) {
 function renderSearchPanel() {
   const d = cur();
   const panel = $("searchPanel");
-  if (!d || !d.searchResults.length || $("searchBox").classList.contains("hidden")) {
-    panel.classList.add("hidden");
-    panel.innerHTML = "";
-    $("searchCount").textContent = d && d.searchLoading ? "搜索中…" : d && d.searchQuery ? "0/0" : "";
+  $("btnSearchResults").classList.toggle("hidden", !d?.searchQuery || $("searchBox").classList.contains("hidden"));
+  if (!d?.searchQuery || $("searchBox").classList.contains("hidden")) {
+    if (!panel.classList.contains("hidden")) switchSidebar(sidebarBeforeSearch);
+    panel.replaceChildren();
+    lastSearchResults = null;
+    $("searchCount").textContent = "";
     return;
   }
-  $("searchCount").textContent = (d.searchIdx + 1) + "/" + d.searchResults.length;
-  panel.classList.remove("hidden");
-  panel.innerHTML = "";
-  d.searchResults.forEach((r, k) => {
-    const b = document.createElement("button");
-    b.className = "sres" + (k === d.searchIdx ? " active" : "");
-    b.innerHTML = '<span class="spg">p' + (r.page + 1) + '</span><span class="stxt">' + buildSnippet(r.text, r.idx, r.end - r.start) + "</span>";
-    b.addEventListener("click", () => goToMatch(k));
-    panel.appendChild(b);
-  });
-  const active = panel.querySelector(".sres.active");
-  if (active) active.scrollIntoView({ block: "nearest" });
+  const results = d.searchResults;
+  $("searchCount").textContent = d.searchLoading ? "搜索中…" : results.length ? `${d.searchIdx + 1}/${results.length}` : "0/0";
+  if (results !== lastSearchResults || !results.length) {
+    const fragment = document.createDocumentFragment();
+    if (!results.length) {
+      const status = document.createElement("p");
+      status.className = "empty-hint";
+      status.textContent = d.searchLoading ? "正在搜索…" : d.searchScope === "translation" && !d.translatedSearchPages
+        ? "本篇暂无已保存的译文。" : "没有找到匹配结果。";
+      fragment.append(status);
+    }
+    results.forEach((r, k) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "sres";
+      button.innerHTML = '<span class="spg">p' + (r.page + 1) + '</span><span class="stxt">' + buildSnippet(r.text, r.idx, r.end - r.idx) + "</span>";
+      button.addEventListener("click", () => goToMatch(k));
+      button.addEventListener("keydown", (event) => {
+        if (!["ArrowDown", "ArrowUp"].includes(event.key)) return;
+        event.preventDefault();
+        const next = (k + (event.key === "ArrowUp" ? -1 : 1) + results.length) % results.length;
+        panel.querySelectorAll(".sres")[next]?.focus();
+        goToMatch(next);
+      });
+      fragment.append(button);
+    });
+    panel.replaceChildren(fragment);
+    lastSearchResults = results;
+  }
+  for (const [index, button] of [...panel.querySelectorAll(".sres")].entries()) {
+    button.classList.toggle("active", index === d.searchIdx);
+    button.setAttribute("aria-current", String(index === d.searchIdx));
+  }
+  panel.querySelector(".sres.active")?.scrollIntoView({ block: "nearest" });
 }
 
-function goToMatch(k) {
-  const d = cur(); if (!d) return;
-  if (!d.searchResults.length) return;
+async function goToMatch(k) {
+  const d = cur();
+  if (!d?.searchResults.length) return;
   k = (k + d.searchResults.length) % d.searchResults.length;
   d.searchIdx = k;
-  const r = d.searchResults[k];
-  d.searchMatch = r;
-  goToPage(r.page + 1);
-  readerSearch.select(d, r);
+  const result = d.searchResults[k];
+  d.searchMatch = result;
   renderSearchPanel();
+  if (result.scope === "translation" && !d.translations[result.page]) {
+    try {
+      const response = await fetch("/api/translate_page", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pdf_hash: d.id, page: result.page, settings: translationCacheSettings(), cached_only: true }),
+      });
+      if (!response.ok) throw new Error();
+      const data = await response.json();
+      if (cur() !== d || d.searchMatch !== result) return;
+      if (data.blocks?.length) d.translations[result.page] = data;
+    } catch (_) {
+      if (cur() === d && d.searchMatch === result) toast("无法打开已保存的译文");
+      return;
+    }
+  } else if (state.mode === "duo" && result.scope !== "translation" && !d.duoShowOriginal) {
+    await setDuoOriginalVisibility(true);
+  }
+  if (cur() !== d || d.searchMatch !== result) return;
+  goToPage(result.page + 1);
+  readerSearch.select(d, result);
 }
 
 function nextMatch(backward) {
@@ -1760,23 +2180,111 @@ function nextMatch(backward) {
 
 /* ================= 设置 ================= */
 let settingsReturnFocus = null;
+let connectionCheck = 0;
+let defaultTranslationPrompt = "";
+let translationPromptRequest = null;
+
+async function showDefaultTranslationPrompt() {
+  const input = $("setTranslationPrompt");
+  const reset = $("btnResetTranslationPrompt");
+  const status = $("translationPromptStatus");
+  status.classList.add("hidden");
+  if (!defaultTranslationPrompt) {
+    input.placeholder = "正在读取默认提示词…";
+    translationPromptRequest ??= fetch("/api/translation_prompt").then(async (response) => {
+      if (!response.ok) throw new Error("Could not load default translation prompt");
+      const value = (await response.json()).default;
+      if (typeof value !== "string" || !value) throw new Error("Missing default translation prompt");
+      return value;
+    });
+    try {
+      defaultTranslationPrompt = await translationPromptRequest;
+    } catch (_) {
+      status.textContent = "暂时无法读取默认提示词。重新展开后可重试。";
+      status.classList.remove("hidden");
+      return;
+    } finally {
+      input.placeholder = "";
+      translationPromptRequest = null;
+    }
+  }
+  if (!input.value && !input.dataset.edited) input.value = defaultTranslationPrompt;
+  reset.disabled = false;
+}
+
+function readSettingsForm() {
+  const temperature = $("setTemperature").valueAsNumber;
+  const prompt = $("setTranslationPrompt").value.trim();
+  return {
+    api_key: $("setApiKey").value.trim(),
+    model: $("setModel").value || DEFAULT_SETTINGS.model,
+    base_url: $("setBaseUrl").value.trim() || DEFAULT_SETTINGS.base_url,
+    target: $("setTarget").value.trim() || DEFAULT_SETTINGS.target,
+    translation_prompt: prompt === defaultTranslationPrompt ? "" : prompt,
+    temperature: Number.isFinite(temperature) ? Math.min(1, Math.max(0, temperature)) : DEFAULT_SETTINGS.temperature,
+    prefetch: Number($("setPrefetch").value),
+  };
+}
+
+function resetConnectionCheck() {
+  connectionCheck++;
+  $("btnTestConnection").disabled = false;
+  $("connectionStatus").textContent = "";
+  delete $("connectionStatus").dataset.result;
+}
+
+async function testConnection() {
+  const check = ++connectionCheck;
+  const button = $("btnTestConnection");
+  const status = $("connectionStatus");
+  status.textContent = "正在测试…";
+  delete status.dataset.result;
+  button.disabled = true;
+  try {
+    const response = await fetch("/api/translation_connection", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(readSettingsForm()),
+    });
+    const data = await response.json();
+    if (check !== connectionCheck) return;
+    status.textContent = response.ok && data.ok ? "连接成功，可以翻译。" : data.message || "连接测试失败。";
+    status.dataset.result = response.ok && data.ok ? "success" : "error";
+  } catch (_) {
+    if (check !== connectionCheck) return;
+    status.textContent = "无法连接本机 Folio 服务。";
+    status.dataset.result = "error";
+  } finally {
+    if (check === connectionCheck) button.disabled = false;
+  }
+}
 
 function openSettings() {
-  if ($("settingsModal").classList.contains("hidden")) settingsReturnFocus = document.activeElement;
+  if (!$("settingsModal").classList.contains("hidden")) return;
+  settingsReturnFocus = document.activeElement.closest("#readerViewMenu")?.querySelector("summary") || document.activeElement;
+  resetConnectionCheck();
   const s = loadSettings();
   $("setApiKey").value = s.api_key;
   $("setModel").value = s.model;
   $("setBaseUrl").value = s.base_url;
   $("setTarget").value = s.target;
+  const input = $("setTranslationPrompt");
+  delete input.dataset.edited;
+  input.value = s.translation_prompt || defaultTranslationPrompt;
+  if ($("translationPromptSettings").open) showDefaultTranslationPrompt();
   $("setTemperature").value = s.temperature;
+  $("setPrefetch").value = [0, 1, 3].includes(Number(s.prefetch)) ? String(s.prefetch) : "0";
   $("setApiKey").type = "password";
   $("btnShowKey").textContent = "显示";
   $("settingsModal").classList.remove("hidden");
+  $("settingsModal").inert = false;
   $("setApiKey").focus({ preventScroll: true });
 }
 
 function closeSettings() {
   if ($("settingsModal").classList.contains("hidden")) return;
+  resetConnectionCheck();
+  $("settingsModal").inert = true;
   $("settingsModal").classList.add("hidden");
   if (settingsReturnFocus?.isConnected && settingsReturnFocus.getClientRects().length) {
     settingsReturnFocus.focus({ preventScroll: true });
@@ -1806,22 +2314,48 @@ function handleSettingsKeydown(e) {
   }
 }
 
+/* ================= 桌面命令 ================= */
+window.folioMenuCommand = async (command, detail) => {
+  if (command === "imported") {
+    const { hashes = [], failed = 0, total = hashes.length + failed } = detail || {};
+    if (hashes.length) {
+      if (total === 1) await reopenDoc(hashes[0]);
+      else {
+        showLibrary();
+        await PaperLibrary.reload();
+      }
+    }
+    if (total > 1 || failed) toast(`已导入 ${hashes.length} 份 PDF${failed ? `，${failed} 份失败` : ""}`);
+    return;
+  }
+  if (!$("storageModal").classList.contains("hidden") || $("paperOverview").open) return;
+  if (command === "settings") { openSettings(); return; }
+  if (!$("settingsModal").classList.contains("hidden")) return;
+  if (command === "open") $("fileInput").click();
+  else if (command === "close" && cur() && !$("app").classList.contains("hidden")) closeTab(state.active);
+};
+
 /* ================= 初始化 ================= */
 async function init() {
-  readerNotes.init({ getDoc: cur, getMode: () => state.mode, goToPage, toast });
+  $("btnDocumentSearch").title = `搜索文档（${shortcutModifier}+F）`;
+  $("btnLibrarySearch").title = `搜索论文标题（${shortcutModifier}+F）`;
+  $("librarySearchShortcut").textContent = `${shortcutModifier} F`;
+  readerNotes.init({ getDoc: cur, getMode: () => state.mode, goToPage, revealOriginal: () => setDuoOriginalVisibility(true), toast });
   StorageManager.init({ toast });
+  PaperOverview.init();
+  $("btnPaperOverview").addEventListener("click", () => PaperOverview.open(cur(), loadSettings, readOverviewSource, openSettings));
   ReaderChrome.init();
   // 上传 / 拖拽
   $("dropZone").addEventListener("click", () => $("fileInput").click());
   $("btnLibraryAdd").addEventListener("click", () => $("fileInput").click());
-  $("btnLibrarySearch").addEventListener("click", () => $("librarySearch").focus());
+  $("btnLibrarySearch").addEventListener("click", () => PaperLibrary.focusSearch());
   $("btnLibrarySettings").addEventListener("click", openSettings);
   // Keep the floating results below the toolbar when controls wrap on a small window.
   const toolbarResize = new ResizeObserver(() => {
     if (!$("app").classList.contains("hidden")) document.documentElement.style.setProperty("--search-panel-top", ($("topbar").getBoundingClientRect().bottom + 8) + "px");
   });
   toolbarResize.observe($("topbar"));
-  $("fileInput").addEventListener("change", (e) => { handleFile(e.target.files[0]); e.target.value = ""; });
+  $("fileInput").addEventListener("change", (e) => { handleFiles(e.target.files); e.target.value = ""; });
   $("btnOpen").addEventListener("click", () => $("fileInput").click());
   $("btnLibrary").addEventListener("click", showLibrary);
   ["dragenter", "dragover"].forEach((ev) =>
@@ -1829,13 +2363,34 @@ async function init() {
   ["dragleave", "drop"].forEach((ev) =>
     document.addEventListener(ev, (e) => { e.preventDefault(); $("dropZone").classList.remove("over"); }));
   document.addEventListener("drop", (e) => {
-    const f = e.dataTransfer.files && e.dataTransfer.files[0];
-    if (f) handleFile(f);
+    if (e.dataTransfer.files?.length) handleFiles(e.dataTransfer.files);
   });
 
   // 视图切换
   document.querySelectorAll("#viewSeg .v").forEach((b) => {
-    b.addEventListener("click", () => applyMode(b.dataset.mode));
+    b.addEventListener("click", () => selectReaderView(b.dataset.view));
+  });
+  for (const button of $("readerFlowOptions").querySelectorAll("button")) {
+    button.addEventListener("click", () => applyMode(button.dataset.flow));
+  }
+  const viewMenu = $("readerViewMenu");
+  const viewMenuTrigger = viewMenu.querySelector("summary");
+  $("btnHideToolbar").addEventListener("click", () => $("btnReaderChrome").click());
+  viewMenu.addEventListener("click", (event) => {
+    const button = event.target.closest(".reader-menu-action");
+    if (!button) return;
+    if (viewMenu.contains(document.activeElement)) viewMenuTrigger.focus();
+    viewMenu.open = false;
+  });
+  document.addEventListener("pointerdown", (event) => {
+    if (viewMenu.open && !viewMenu.contains(event.target)) viewMenu.open = false;
+  });
+  viewMenu.addEventListener("keydown", (event) => {
+    if (viewMenu.open && event.key === "Escape") {
+      event.stopPropagation();
+      viewMenu.open = false;
+      viewMenuTrigger.focus();
+    }
   });
 
   // 缩放
@@ -1843,18 +2398,27 @@ async function init() {
   $("btnZoomOut").addEventListener("click", () => zoomBy(1 / 1.2));
   $("btnFitWidth").addEventListener("click", () => {
     const d = cur(); if (!d) return;
+    if (state.mode === "duo") {
+      fitDuoWidth(d.duoZoomTarget);
+      return;
+    }
     d.fitWidth = true; d.scale = fitWidthScale(d); onScaleChange();
   });
-  for (const [prefix, side] of [["Orig", "original"], ["Trans", "translation"]]) {
-    $("btn" + prefix + "ZoomIn").addEventListener("click", () => zoomDuoBy(side, 1.2));
-    $("btn" + prefix + "ZoomOut").addEventListener("click", () => zoomDuoBy(side, 1 / 1.2));
-    $("btn" + prefix + "Fit").addEventListener("click", () => fitDuoWidth(side));
-  }
-  $("btnToggleOriginal").addEventListener("click", toggleDuoOriginal);
+  $("duoZoomTarget").addEventListener("change", (event) => setDuoZoomTarget(event.target.value));
+  $("btnDuoSync").addEventListener("click", () => {
+    const d = cur();
+    if (!d || !d.duoShowOriginal) return;
+    d.duoSync = !d.duoSync;
+    updateZoomLabel();
+    if (d.duoSync) syncDuoScroll(d.duoZoomTarget);
+    persistCurrentProgress();
+  });
   document.querySelectorAll(".duo-pane").forEach((pane) => {
+    const side = pane.dataset.duoSide;
     for (const event of ["pointerdown", "focusin"]) {
-      pane.addEventListener(event, () => { if (cur()) cur().duoZoomTarget = pane.dataset.duoSide; });
+      pane.addEventListener(event, () => setDuoZoomTarget(side));
     }
+    pane.querySelector(".duo-scroll").addEventListener("scroll", () => syncDuoScroll(side, true), { passive: true });
   });
   $("viewer").addEventListener("wheel", (e) => {
     if (!e.ctrlKey && !e.metaKey) return;
@@ -1869,20 +2433,16 @@ async function init() {
     if (cur() && state.mode === "duo" && !$("app").classList.contains("hidden")) renderDuo();
   }, 200));
   duoResize.observe(document.querySelector(".duo-body"));
-  const duoToolbarResize = new ResizeObserver((entries) => {
-    for (const entry of entries) {
-      const pane = entry.target.closest(".duo-pane");
-      if (pane) pane.style.setProperty("--duo-toolbar-height", `${Math.ceil(entry.target.getBoundingClientRect().height)}px`);
-    }
-  });
-  document.querySelectorAll(".duo-toolbar").forEach((toolbar) => duoToolbarResize.observe(toolbar));
-
   // 翻页
   $("btnPrev").addEventListener("click", () => goToPage(cur() ? cur().currentPage - 1 : 1));
   $("btnNext").addEventListener("click", () => goToPage(cur() ? cur().currentPage + 1 : 1));
   $("pageInput").addEventListener("change", (e) => {
-    const n = parseInt(e.target.value, 10);
-    if (Number.isFinite(n)) goToPage(n);
+    const d = cur();
+    if (!d) return;
+    const n = Number.parseInt(e.target.value, 10);
+    const page = Number.isFinite(n) ? Math.min(d.pagesMeta.length, Math.max(1, n)) : d.currentPage;
+    e.target.value = page;
+    if (page !== d.currentPage) goToPage(page);
   });
 
   // 侧栏
@@ -1893,35 +2453,11 @@ async function init() {
     $("btnSidebar").setAttribute("aria-label", collapsed ? "展开文档导航" : "收起文档导航");
     $("btnSidebar").title = collapsed ? "展开文档导航" : "收起文档导航";
     $("sidebarContent").inert = collapsed;
+    syncDockedNavigation();
   };
-  let sidebarTransitionId = 0;
-  let sidebarTransitionTimer = 0;
   const setSidebarCollapsed = (collapsed) => {
-    const sidebar = $("sidebar");
-    const transitionId = ++sidebarTransitionId;
-    clearTimeout(sidebarTransitionTimer);
-
-    // Pin the current rendered height before changing layout. This lets the
-    // full-height panel morph into the compact title capsule without an auto-height jump.
-    sidebar.style.height = `${sidebar.getBoundingClientRect().height}px`;
-    sidebar.style.alignSelf = "flex-start";
-    sidebar.getBoundingClientRect();
-    sidebar.classList.toggle("collapsed", collapsed);
+    $("sidebar").classList.toggle("collapsed", collapsed);
     syncSidebarToggle();
-
-    requestAnimationFrame(() => {
-      if (transitionId !== sidebarTransitionId) return;
-      const targetHeight = collapsed
-        ? Math.ceil($("sidebarControlCluster").getBoundingClientRect().bottom - sidebar.getBoundingClientRect().top + 2)
-        : Math.ceil($("main").getBoundingClientRect().height);
-      sidebar.style.height = `${targetHeight}px`;
-    });
-
-    sidebarTransitionTimer = setTimeout(() => {
-      if (transitionId !== sidebarTransitionId || sidebar.classList.contains("collapsed")) return;
-      sidebar.style.height = "";
-      sidebar.style.alignSelf = "";
-    }, 360);
   };
   syncSidebarToggle();
   $("btnSidebar").addEventListener("click", () => {
@@ -1936,9 +2472,21 @@ async function init() {
   $("btnSearchClose").addEventListener("click", closeSearch);
   $("btnSearchNext").addEventListener("click", () => nextMatch(false));
   $("btnSearchPrev").addEventListener("click", () => nextMatch(true));
-  $("searchInput").addEventListener("input", throttle((e) => runSearch(e.target.value), 220));
+  $("searchInput").addEventListener("input", throttle((e) => {
+    if (!$("searchBox").classList.contains("hidden")) runSearch(e.target.value);
+  }, 220));
+  $("searchScope").addEventListener("change", (event) => {
+    if (!cur()) return;
+    cur().searchScope = event.target.value;
+    runSearch($("searchInput").value);
+  });
   $("searchInput").addEventListener("keydown", (e) => {
     if (e.key === "Enter") { e.preventDefault(); nextMatch(e.shiftKey); }
+    if (e.key === "ArrowDown" && cur()?.searchResults.length) {
+      e.preventDefault();
+      switchSidebar("search");
+      $("searchPanel").querySelector(".sres.active")?.focus();
+    }
     if (e.key === "Escape") closeSearch();
   });
 
@@ -1946,15 +2494,44 @@ async function init() {
   $("btnSettings").addEventListener("click", openSettings);
   $("btnCloseSettings").addEventListener("click", closeSettings);
   $("btnCancelSettings").addEventListener("click", closeSettings);
+  $("btnTestConnection").addEventListener("click", testConnection);
+  $("translationPromptSettings").addEventListener("toggle", (event) => {
+    if (event.target.open && !$("settingsModal").classList.contains("hidden")) {
+      showDefaultTranslationPrompt();
+      event.target.scrollIntoView({ block: "nearest" });
+    }
+  });
+  $("setTranslationPrompt").addEventListener("input", (event) => { event.target.dataset.edited = "true"; });
+  $("btnResetTranslationPrompt").addEventListener("click", () => {
+    $("setTranslationPrompt").value = defaultTranslationPrompt;
+    $("setTranslationPrompt").focus({ preventScroll: true });
+    resetConnectionCheck();
+  });
+  $("settingsModal").addEventListener("input", resetConnectionCheck);
   $("btnSaveSettings").addEventListener("click", () => {
-    saveSettings({
-      api_key: $("setApiKey").value.trim(),
-      model: $("setModel").value,
-      base_url: $("setBaseUrl").value.trim() || DEFAULT_SETTINGS.base_url,
-      target: $("setTarget").value.trim() || DEFAULT_SETTINGS.target,
-      temperature: Math.min(1, Math.max(0, Number($("setTemperature").value) || 0.3)),
-    });
+    const before = loadSettings();
+    try {
+      saveSettings(readSettingsForm());
+    } catch (_) {
+      $("connectionStatus").textContent = "设置未能保存，请检查本机存储。";
+      $("connectionStatus").dataset.result = "error";
+      return;
+    }
+    const after = loadSettings();
+    const outputChanged = ["model", "base_url", "target", "translation_prompt"].some((key) => before[key] !== after[key]);
+    const connectionChanged = outputChanged || before.api_key !== after.api_key || before.temperature !== after.temperature;
+    if (connectionChanged) {
+      translationGeneration++;
+      for (const doc of state.tabs) {
+        doc.translationErrors = {};
+        doc.translationChecked.clear();
+        if (outputChanged) doc.translations = {};
+      }
+      const d = cur();
+      if (outputChanged && d?.searchScope === "translation" && d.searchQuery) runSearch(d.searchQuery);
+    }
     closeSettings();
+    if (cur() && state.mode === "duo") { ensureDuoWindow(); renderDuo(); }
     toast("设置已保存");
   });
   $("btnShowKey").addEventListener("click", () => {
@@ -1986,6 +2563,17 @@ async function init() {
 
   // 键盘
   document.addEventListener("keydown", (e) => {
+    if ($("paperOverview").open) return;
+    if (isMac && e.metaKey && !e.altKey && !e.shiftKey && !e.defaultPrevented) {
+      const command = { o: "open", w: "close", ",": "settings" }[e.key.toLowerCase()];
+      if (command) {
+        if (command !== "close" || (cur() && !$("app").classList.contains("hidden"))) {
+          e.preventDefault();
+          window.folioMenuCommand(command);
+          return;
+        }
+      }
+    }
     if (!$("settingsModal").classList.contains("hidden")) {
       handleSettingsKeydown(e);
       return;
@@ -1995,7 +2583,7 @@ async function init() {
     const typing = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || e.target.isContentEditable;
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f") {
       e.preventDefault();
-      if ($("app").classList.contains("hidden")) $("librarySearch").focus(); else openSearch();
+      if ($("app").classList.contains("hidden")) PaperLibrary.focusSearch(); else openSearch();
       return;
     }
     if (e.key === "Escape") {
@@ -2016,15 +2604,26 @@ async function init() {
     }
   });
 
-  window.addEventListener("resize", throttle(() => {
-    const d = cur(); if (!d || d.restoring || $("app").classList.contains("hidden")) return;
-    if (d.fitWidth && state.mode !== "duo") {
-      persistCurrentProgress();
-      d.pendingRestore = { ...d.reading }; d.restoring = true;
-      d.scale = fitWidthScale(d); updateZoomLabel(); buildSlots();
-      if (state.mode === "continuous") restoreReadingPosition(d); else renderSingle();
-    } else if (state.mode === "continuous") renderVisible();
-  }, 200));
+  let fitResizeTimer = 0;
+  new ResizeObserver(() => {
+    clearTimeout(fitResizeTimer);
+    fitResizeTimer = setTimeout(() => {
+      const d = cur();
+      if (!d || d.restoring || $("app").classList.contains("hidden") || state.mode === "duo") return;
+      const scale = fitWidthScale(d);
+      if (d.fitWidth && Math.abs(scale - d.scale) > 0.005) {
+        persistCurrentProgress();
+        d.pendingRestore = { ...d.reading };
+        d.restoring = true;
+        d.scale = scale;
+        updateZoomLabel();
+        if (state.mode === "continuous") {
+          buildSlots();
+          restoreReadingPosition(d);
+        } else renderSingle();
+      } else if (state.mode === "continuous") renderVisible();
+    }, reduceMotion.matches ? 0 : 85);
+  }).observe($("viewer"));
 
   const saveOnExit = () => { persistCurrentProgress(); PaperLibrary.flush(true); };
   window.addEventListener("pagehide", saveOnExit);

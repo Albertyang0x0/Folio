@@ -7,10 +7,12 @@
   GET  /api/storage        查看本机存储占用
   POST /api/clear_cache    清空翻译缓存
 """
+import asyncio
 import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import threading
@@ -25,9 +27,10 @@ from pydantic import BaseModel
 
 from exporter import build_translated_pdf
 from extraction import extract_pages
-from translator import (translate_segments, _placeholder_order, _style_marker_order,
-                        _valid_style_markup, _strip_style_markers, TranslationError)
+from translator import (DEFAULT_BASE_URL, DEFAULT_TRANSLATION_PROMPT, check_translation_connection, configured_model, configured_translation_prompt, translate_segments, _placeholder_order, _style_marker_order,
+                        _valid_style_markup, _strip_style_markers, _is_nontranslatable, TranslationError, TranslationServiceError)
 from library import PaperLibrary, valid_hash
+from paper_overview import OVERVIEW_VERSION, generate_overview
 
 if getattr(sys, "frozen", False):
     # PyInstaller 打包运行：exe 所在目录放数据（可写），资源目录放前端静态文件
@@ -61,7 +64,9 @@ async def _no_cache_static(request, call_next):
 
 MAX_PDF = 80 * 1024 * 1024
 CHUNK_CHARS = 6000  # 每次请求最多送这么多字符去翻译
-EXTRACT_VER = 22  # 保留原文段落边界及段内粗体/斜体区间
+CHUNK_SEGMENTS = 12
+_BYLINE = re.compile(r"[^\W\d_][\w.'’\-]*(?: +[^\W\d_][\w.'’\-]*){1,5} *[*∗†‡]+", re.UNICODE)
+EXTRACT_VER = 30  # 跨文本块的公式行及对齐的定义行
 PROMPT_VER = 7    # 翻译协议保护并校验成对的局部样式标记
 
 
@@ -76,6 +81,11 @@ class TranslateReq(BaseModel):
 class ExportReq(BaseModel):
     pdf_hash: str
     items: list = []
+
+
+class OverviewReq(BaseModel):
+    pdf_hash: str
+    settings: dict = {}
 
 
 class ReadingReq(BaseModel):
@@ -105,7 +115,7 @@ def _storage_snapshot():
     papers = _files_stats(UPLOAD_DIR.glob("*.pdf"))
     extracted = _files_stats(list(UPLOAD_DIR.glob("*.pages.json")) + list(UPLOAD_DIR.glob("*.meta.json")))
     translations = _files_stats(CACHE_DIR.glob("*.json"))
-    records = _files_stats(library.directory.glob("*.json"))
+    records = _files_stats(library.directory.rglob("*.json"))
     classified_bytes = papers["bytes"] + extracted["bytes"] + translations["bytes"] + records["bytes"]
     classified_files = papers["files"] + extracted["files"] + translations["files"] + records["files"]
     total_stats = _files_stats(DATA_DIR.rglob("*"))
@@ -166,10 +176,28 @@ def api_library_reading(pdf_hash: str, req: ReadingReq):
         raise HTTPException(500, "阅读状态未保存，请检查本地数据目录是否可写") from exc
 
 
-def _library_entry(digest, file_name):
+class LibraryPresentationReq(BaseModel):
+    display_title: str | None = None
+    archived: bool | None = None
+
+
+@app.post("/api/library/{pdf_hash}/presentation")
+def api_library_presentation(pdf_hash: str, req: LibraryPresentationReq):
+    try:
+        return library.edit_presentation(pdf_hash, req.display_title, req.archived)
+    except KeyError as exc:
+        raise HTTPException(404, "论文已不在库中，请重新载入论文库") from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(500, "论文信息未保存，请检查本地数据目录是否可写") from exc
+
+
+def _library_entry(digest, file_name, restore=False):
     # Library errors must not block opening/reading an otherwise valid PDF.
     try:
-        return {"library_entry": library.register(digest, file_name)}
+        record = library.register(digest, file_name)
+        return {"library_entry": library.present(record, restore=restore)}
     except (ValueError, OSError, RuntimeError):
         return {"library_error": "论文库信息未保存，请检查本地数据目录或重试"}
 
@@ -244,46 +272,96 @@ def _re_extract(pdf_hash, pdf_data=None, file_name="document.pdf"):
     (UPLOAD_DIR / f"{pdf_hash}.pdf").write_bytes(pdf_data) if pdf_data is not None else None
     _pages_path(pdf_hash).write_text(json.dumps(pages, ensure_ascii=False), encoding="utf-8")
     _save_meta(pdf_hash, file_name, outline)
-    # Only reuse a page when its translation inputs are identical. Geometry-only
-    # fixes need no provider call; changed paragraph/token structure must miss.
-    # Keep the old namespace intact instead of deleting all previous translations.
+    # Retain valid translations for blocks with identical inputs, including
+    # when a newly eligible caption or section changes the rest of its page.
     try:
-        _migrate_unchanged_cache(pdf_hash, old_meta.get("extract_ver"), old_pages, pages)
+        _migrate_translation_cache(pdf_hash, old_meta.get("extract_ver"), old_pages, pages)
     except (ValueError, OSError, TypeError, KeyError):
         pass
     return pages, outline
 
 
-def _translation_signature(page):
-    return [(b["text"], b.get("translation_text", b["text"]), bool(b.get("math")), bool(b.get("skip")),
-             [(m["token"], m["text"]) for m in b.get("inline_math", [])],
-             [(s["token"], bool(s.get("bold")), bool(s.get("italic")))
-              for s in b.get("inline_styles", [])])
-            for b in page["blocks"]]
+_RENDER_TOKEN = re.compile(r"__MATH_\d{4,}__|__STYLE_\d{4,}_(?:OPEN|CLOSE)__")
 
 
-def _migrate_unchanged_cache(pdf_hash, old_version, old_pages, pages):
+def _render_tokens(block):
+    tokens = [math["token"] for math in block.get("inline_math", [])]
+    for style in block.get("inline_styles", []):
+        tokens.extend(style["token"][:-2] + suffix for suffix in ("_OPEN__", "_CLOSE__"))
+    return tokens
+
+
+def _translation_signature(block):
+    # Token IDs are page-local. An extra styled span on one line can renumber
+    # every later paragraph without changing its text or formatting.
+    aliases = {token: f"\0{i}\0" for i, token in enumerate(_render_tokens(block))}
+    source = block.get("translation_text", block["text"])
+    return (block["text"], _RENDER_TOKEN.sub(lambda m: aliases.get(m[0], m[0]), source),
+            bool(block.get("math")), bool(block.get("skip")),
+            tuple(math["text"] for math in block.get("inline_math", [])),
+            tuple((bool(style.get("bold")), bool(style.get("italic")))
+                  for style in block.get("inline_styles", [])))
+
+
+def _migrate_translation_cache(pdf_hash, old_version, old_pages, pages):
     if old_version is None or old_version == EXTRACT_VER:
         return
-    unchanged = {i for i, (old, new) in enumerate(zip(old_pages, pages))
-                 if _translation_signature(old) == _translation_signature(new)}
     prefix = f"{old_version}|{PROMPT_VER}|"
     with _cache_lock:
         cache = _load_cache(pdf_hash)
         changed = False
         for key, values in list(cache.items()):
-            if not key.startswith(prefix):
+            versioned_key = key.removeprefix("partial|")
+            if not versioned_key.startswith(prefix):
                 continue
-            fields = key.split("|", 4)
+            fields = versioned_key.split("|", 4)
             if len(fields) != 5 or not fields[2].isdigit():
                 continue
             page_no = int(fields[2])
-            if page_no not in unchanged or not _valid_formula_tokens(pages[page_no]["blocks"], values):
+            if not 0 <= page_no < min(len(old_pages), len(pages)):
                 continue
-            new_key = str(EXTRACT_VER) + "|" + key.split("|", 1)[1]
-            if new_key not in cache:
-                cache[new_key] = values
-                changed = True
+            old_page, new_page = old_pages[page_no], pages[page_no]
+            old_blocks, new_blocks = old_page["blocks"], new_page["blocks"]
+            if not isinstance(values, list) or len(values) != len(old_blocks):
+                continue
+            new_key = f"{EXTRACT_VER}|" + versioned_key.split("|", 1)[1]
+            if new_key in cache:
+                continue
+            old_signatures = [_translation_signature(block) for block in old_blocks]
+            new_signatures = [_translation_signature(block) for block in new_blocks]
+            if old_signatures == new_signatures:
+                matches = enumerate(zip(old_blocks, values))
+            else:
+                by_source = {(sign, tuple(b["bbox"])): (b, value)
+                             for sign, b, value in zip(old_signatures, old_blocks, values)}
+                matches = ((i, by_source.get((sign, tuple(b["bbox"])), (None, None)))
+                           for i, (sign, b) in enumerate(zip(new_signatures, new_blocks)))
+            partial_key = "partial|" + new_key
+            prior = cache.get(partial_key)
+            migrated = [None] * len(new_blocks)
+            if isinstance(prior, list) and len(prior) == len(new_blocks):
+                migrated = [t if _valid_formula_tokens([b], [t]) else None for b, t in zip(new_blocks, prior)]
+            for i, (old_block, value) in matches:
+                if migrated[i] is not None or old_block is None or not _valid_formula_tokens([old_block], [value]):
+                    continue
+                block = new_blocks[i]
+                token_map = dict(zip(_render_tokens(old_block), _render_tokens(block)))
+                value = _RENDER_TOKEN.sub(lambda m: token_map.get(m[0], m[0]), value)
+                source = block.get("translation_text", block["text"])
+                if (value == source and not (block.get("math") or block.get("skip"))
+                        and ("中文" in fields[4] or "chinese" in fields[4].lower())
+                        and not _is_nontranslatable(source, fields[4])):
+                    continue
+                if _valid_formula_tokens([block], [value]):
+                    migrated[i] = value
+            if _valid_formula_tokens(new_blocks, migrated):
+                cache[new_key] = migrated
+                cache.pop(partial_key, None)
+            elif any(t is not None and not (b.get("math") or b.get("skip")) for b, t in zip(new_blocks, migrated)):
+                cache[partial_key] = migrated
+            else:
+                continue
+            changed = True
         if changed:
             (CACHE_DIR / f"{pdf_hash}.json").write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
 
@@ -339,7 +417,7 @@ async def api_parse(file: UploadFile = File(...)):
     if not saved_pdf.exists() or hashlib.sha256(saved_pdf.read_bytes()).hexdigest() != digest:
         saved_pdf.write_bytes(data)
     return {"pdf_hash": digest, "file_name": file.filename, "pages": pages, "outline": outline,
-            **_library_entry(digest, file.filename or "document.pdf")}
+            **_library_entry(digest, file.filename or "document.pdf", restore=True)}
 
 
 @app.get("/api/doc/{pdf_hash}")
@@ -403,18 +481,124 @@ def _valid_formula_tokens(blocks, translations):
         for b, t in zip(blocks, translations)))
 
 
+def _translation_cache_key(page, settings):
+    base, model = configured_model(settings)
+    target = settings.get("target") or "简体中文"
+    key = f"{EXTRACT_VER}|{PROMPT_VER}|{page}|{model}|{target}"
+    if base.lower() not in {DEFAULT_BASE_URL, f"{DEFAULT_BASE_URL}/v1"}:
+        key += "|endpoint=" + hashlib.sha256(base.encode()).hexdigest()[:16]
+    # The default can change without changing the protocol or saved overrides.
+    prompt = configured_translation_prompt(settings)
+    return key + "|prompt=" + hashlib.sha256(prompt.encode()).hexdigest()
+
+
+@app.get("/api/translation_prompt")
+def api_translation_prompt():
+    return {"default": DEFAULT_TRANSLATION_PROMPT}
+
+
+@app.post("/api/translation_connection")
+async def api_translation_connection(settings: dict):
+    try:
+        await check_translation_connection(settings)
+    except TranslationServiceError as exc:
+        return JSONResponse(status_code=422, content=exc.failure)
+    return {"ok": True}
+
+
+def _overview_path(pdf_hash):
+    if not valid_hash(pdf_hash) or not _pages_path(pdf_hash).is_file():
+        raise HTTPException(404, "论文未找到，请重新打开 PDF")
+    return CACHE_DIR / f"{pdf_hash}.overview.json"
+
+
+def _read_overview(path):
+    try:
+        cached = json.loads(path.read_text(encoding="utf-8"))
+        if (cached.get("version") == OVERVIEW_VERSION and cached.get("extract_ver") == EXTRACT_VER
+                and isinstance(cached.get("overview"), dict)):
+            return cached["overview"]
+    except (OSError, ValueError, AttributeError):
+        pass
+    return None
+
+
+_overview_jobs = {}
+
+
+@app.get("/api/paper_overview/{pdf_hash}")
+def api_cached_overview(pdf_hash: str):
+    return {"overview": _read_overview(_overview_path(pdf_hash))}
+
+
+async def _build_overview(pdf_hash, settings, path):
+    try:
+        overview = await generate_overview(_load_pages(pdf_hash), settings)
+        try:
+            with _cache_lock:
+                PaperLibrary._write_json(path, {"version": OVERVIEW_VERSION, "extract_ver": EXTRACT_VER,
+                                                "overview": overview})
+        except OSError:
+            logger.warning("Could not store paper overview")
+        return {"overview": overview}
+    except TranslationServiceError as exc:
+        return JSONResponse(status_code=422, content=exc.failure)
+    finally:
+        _overview_jobs.pop(pdf_hash, None)
+
+
+@app.post("/api/paper_overview")
+async def api_paper_overview(req: OverviewReq):
+    path = _overview_path(req.pdf_hash)
+    cached = _read_overview(path)
+    if cached is not None:
+        return {"overview": cached}
+    task = _overview_jobs.get(req.pdf_hash)
+    if task is None:
+        task = _overview_jobs[req.pdf_hash] = asyncio.create_task(
+            _build_overview(req.pdf_hash, req.settings, path))
+    return await asyncio.shield(task)
+
+
+class CachedTranslationsReq(BaseModel):
+    pdf_hash: str
+    settings: dict = {}
+
+
+@app.post("/api/cached_translations")
+def api_cached_translations(req: CachedTranslationsReq):
+    if not valid_hash(req.pdf_hash):
+        raise HTTPException(400, "无效的论文编号")
+    pages = _load_pages(req.pdf_hash)
+    cache = _load_cache(req.pdf_hash)
+    result = []
+    for page, meta in enumerate(pages):
+        key = _translation_cache_key(page, req.settings)
+        blocks = meta["blocks"]
+        values = cache.get(key) or cache.get("partial|" + key)
+        if not isinstance(values, list) or len(values) != len(blocks):
+            continue
+        searchable = [(block, value) for block, value in zip(blocks, values)
+                      if not (block.get("skip") or block.get("math")) and _valid_formula_tokens([block], [value])]
+        if searchable:
+            selected_blocks, selected_values = zip(*searchable)
+            result.append({"page": page, "blocks": _translation_blocks(selected_blocks, selected_values)})
+    return {"pages": result}
+
+
 @app.post("/api/translate_page")
 async def api_translate_page(req: TranslateReq):
+    if not valid_hash(req.pdf_hash):
+        raise HTTPException(400, "无效的论文编号")
     pages = _load_pages(req.pdf_hash)
     if not (0 <= req.page < len(pages)):
         raise HTTPException(404, "页码超出范围")
     blocks = pages[req.page]["blocks"]
     if not blocks:
         return {"page": req.page, "blocks": [], "cached": True}
-    model = req.settings.get("model") or "deepseek-chat"
     target = req.settings.get("target") or "简体中文"
     cache = _load_cache(req.pdf_hash)
-    key = f"{EXTRACT_VER}|{PROMPT_VER}|{req.page}|{model}|{target}"
+    key = _translation_cache_key(req.page, req.settings)
     if not req.force and key in cache and _valid_formula_tokens(blocks, cache[key]):
         return {
             "page": req.page,
@@ -422,10 +606,31 @@ async def api_translate_page(req: TranslateReq):
             "cached": True,
         }
     if req.cached_only:
-        return {"page": req.page, "blocks": [], "cached": False}
+        values = cache.get("partial|" + key)
+        partial = []
+        if isinstance(values, list) and len(values) == len(blocks):
+            values = [value if _valid_formula_tokens([block], [value]) else None
+                      for block, value in zip(blocks, values)]
+            partial = _translation_blocks(blocks, values)
+        return {"page": req.page, "blocks": partial, "cached": False, "complete": False}
     # 公式、表格、算法块不翻译，保持原文
     translate_idx = [i for i, b in enumerate(blocks) if not b.get("math") and not b.get("skip")]
     results = [None if i in translate_idx else b["text"] for i, b in enumerate(blocks)]
+    if req.page == 0:
+        abstract = next((b for b in blocks if re.match(r"^\s*(a\s*bstract|summary)\b", b["text"], re.I)), None)
+        if abstract:
+            preceding = [b for b in blocks if b["bbox"][3] < abstract["bbox"][1]]
+            title_size = max((b["font_size"] for b in preceding), default=0)
+            title_bottom = max((b["bbox"][3] for b in preceding if b["font_size"] == title_size), default=0)
+            for i in translate_idx:
+                b = blocks[i]
+                names = re.sub(r"\S+@\S+|\[[\d\s−–-]+\]|\d+|[*∗†‡,;]", " ", b["text"])
+                words = re.findall(r"[^\W\d_][\w.'’\-]*", names, re.UNICODE)
+                author_line = (2 <= len(words) <= 80 and all(w[0].isupper() or w == "and" for w in words)
+                               and not re.search(r"[:?!]|\b(?:University|Institute|School|Department|Laboratory|Abstract)\b", names)
+                               and b["bbox"][1] >= title_bottom)
+                if b["bbox"][3] < abstract["bbox"][1] and (author_line or _BYLINE.fullmatch(b["text"].strip())):
+                    results[i] = b.get("translation_text", b["text"])
     partial_key = "partial|" + key
 
     def reuse_partial(values):
@@ -442,7 +647,7 @@ async def api_translate_page(req: TranslateReq):
     start = 0
     while start < len(pending):
         end, total, segments = start, 0, []
-        while end < len(pending):
+        while end < len(pending) and len(segments) < CHUNK_SEGMENTS:
             b = blocks[pending[end]]
             text = b.get("translation_text", b["text"])
             if segments and total + len(text) > CHUNK_CHARS:
@@ -458,10 +663,10 @@ async def api_translate_page(req: TranslateReq):
             values = exc.results
             failures.update({batch_idx[i]: failure for i, failure in exc.failures.items() if i < len(batch_idx)})
             # Don't repeat a provider-wide failure against each later chunk.
-            stop = any(f["code"] in {"timeout", "network", "service_error"} or f["code"].startswith("upstream_")
-                       for f in exc.failures.values())
-            if stop and exc.failures:
-                reason = next(iter(exc.failures.values()))
+            reason = next((f for f in exc.failures.values()
+                           if f["code"] in {"timeout", "network", "service_error", "tls_setup"} or f["code"].startswith("upstream_")), None)
+            stop = reason is not None
+            if stop:
                 failures.update({i: reason for i in pending[end:]})
         except Exception as exc:
             # An arbitrary exception can include credentials/response bodies.
@@ -536,7 +741,7 @@ async def api_export_pdf(req: ExportReq):
 
 @app.post("/api/clear_cache")
 def api_clear_cache():
-    """Delete only regenerable translation results; never papers, notes or reading state."""
+    """Delete regenerable translations and paper overviews."""
     freed = 0
     failed = 0
     with _cache_lock:
@@ -549,7 +754,7 @@ def api_clear_cache():
                 failed += 1
         snapshot = _storage_snapshot()
     if failed:
-        raise HTTPException(500, f"有 {failed} 个翻译缓存文件未能清理，请检查数据目录是否可写")
+        raise HTTPException(500, f"有 {failed} 个缓存文件未能清理，请检查数据目录是否可写")
     return {"ok": True, "freed_bytes": freed, "storage": snapshot}
 
 
