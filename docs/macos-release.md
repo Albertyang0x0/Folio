@@ -1,6 +1,6 @@
 # macOS 打包与应用内更新
 
-运行 `./build_macos.sh` 构建本机测试包。构建物位于 `dist/Folio.app` 和 `dist/Folio-macOS-<架构>.zip`。`FOLIO_DIST_DIR` 可以指定另一个输出目录，方便保留旧版做升级测试。
+运行 `./build_macos.sh` 构建本机测试包。构建物包括 `dist/Folio.app`、`dist/Folio-macOS-<架构>.zip` 和带版本号的 DMG。DMG 内提供 Applications 快捷方式，供首次安装。`FOLIO_DIST_DIR` 可以指定另一个输出目录，方便保留旧版做升级测试。
 
 ## 打包配置
 
