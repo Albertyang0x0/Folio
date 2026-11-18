@@ -163,6 +163,10 @@ def release_single_instance(handle) -> None:
 def port_is_available(port: int) -> bool:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
+        # Match Uvicorn's listener options. A completed HTTP connection may
+        # still be in TIME_WAIT after the previous Folio instance has quit.
+        if sys.platform != "win32":
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((HOST, port))
         return True
     except OSError:
@@ -425,7 +429,8 @@ def main(argv=None) -> int:
         detail = exception_text(exc)
         logging.getLogger("folio.desktop").error("desktop startup failed: %s", detail)
         if os.environ.get("FOLIO_NO_DIALOG") != "1":
-            show_error(f"{detail}\n\n诊断日志：{log_path}")
+            message = str(exc) if isinstance(exc, RuntimeError) else detail
+            show_error(f"{message}\n\n诊断日志：{log_path}")
         return 1
     finally:
         release_single_instance(mutex)

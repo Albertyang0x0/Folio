@@ -16,8 +16,8 @@ python="$venv_dir/bin/python"
 "$python" -m pip install -r packaging/requirements-build.txt
 arch=$("$python" -c 'import platform; print(platform.machine())')
 
-export FOLIO_VERSION=${FOLIO_VERSION:-0.2.0}
-export FOLIO_BUILD_NUMBER=${FOLIO_BUILD_NUMBER:-200}
+export FOLIO_VERSION=${FOLIO_VERSION:-0.2.1}
+export FOLIO_BUILD_NUMBER=${FOLIO_BUILD_NUMBER:-201}
 feed=${FOLIO_UPDATE_FEED_URL:-}
 public_key=${FOLIO_UPDATE_PUBLIC_KEY:-}
 identity=${FOLIO_SIGN_IDENTITY:-}
